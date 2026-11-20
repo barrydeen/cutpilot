@@ -31,9 +31,12 @@ for (const tool of [
   "project_get", "project_update_settings", "timeline_get",
   "media_import", "media_remove", "media_list", "media_probe",
   "media_detect_silence", "media_thumbnail", "media_contact_sheet",
-  "media_waveform", "track_add", "track_update", "track_move", "track_remove",
+  "media_waveform", "media_transcribe", "transcript_get",
+  "transcript_to_captions", "track_add", "track_update", "track_move", "track_remove",
   "clip_insert", "clip_move", "clip_trim", "clip_split", "clip_remove",
-  "clip_update", "timeline_remove_ranges", "transition_add",
+  "clip_update", "clip_zoom_pan", "clip_set_speed", "clip_color_grade",
+  "clip_duplicate", "clip_unlink", "marker_add", "marker_remove",
+  "timeline_remove_ranges", "transition_add",
   "transition_remove", "caption_style_set", "caption_add", "caption_update",
   "caption_remove", "captions_import", "captions_export",
   "hyperframes_create", "hyperframes_update", "hyperframes_render",
@@ -62,7 +65,7 @@ for (const topic of [
 
 const readme = read("README.md");
 for (const topic of [
-  "openprem-mcp", "openprem-ui", "mcpServers", "cargo build --workspace --release",
+  "cutpilot-mcp", "cutpilot-ui", "mcpServers", "cargo build --workspace --release",
   "ticks", "NVENC", "undo", "HyperFrames",
 ]) {
   must(

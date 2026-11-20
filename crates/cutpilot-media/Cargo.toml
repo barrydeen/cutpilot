@@ -1,0 +1,28 @@
+[package]
+name = "cutpilot-media"
+description = "FFmpeg/ffprobe media pipeline, GPU NVENC export planner, Whisper STT, waveforms, and HyperFrames sidecar for CutPilot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+cutpilot-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+whisper-rs = "0.16"
+ureq = "2"
+
+[features]
+default = []
+whisper-cuda = ["whisper-rs/cuda"]
+whisper-vulkan = ["whisper-rs/vulkan"]
+
+[dev-dependencies]
+tempfile = "3"

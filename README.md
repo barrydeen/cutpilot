@@ -1,121 +1,102 @@
-# OpenPrem
+# CutPilot
 
-**An MCP-first video editor for YouTube, written in Rust.**
+[![CI](https://github.com/barrydeen/cutpilot/actions/workflows/ci.yml/badge.svg)](https://github.com/barrydeen/cutpilot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-OpenPrem is built around one principle: *every semantic editing action lives in a
-versioned command registry that the MCP surface and the native UI share.* A
-coding agent (Claude Code, Cursor, Codex, ...) can perform a **complete edit —
-import 4K phone footage, cut out dead space, add captions, transitions,
-HyperFrames animations, and export an MP4 — entirely over MCP** while a human
-browses and adjusts the same project in the native editor.
+**An MCP-first, GPU-accelerated video editor built in Rust — co-piloted by AI agents and humans on the same live timeline.**
+
+CutPilot is built around one architectural rule: *every semantic editing action lives in a versioned command registry shared equally by the MCP server and the native desktop UI.* An AI coding agent (Claude Code, Cursor, Codex, Windsurf, Antigravity, etc.) can run a **complete edit — import 4K footage and WAV audio, transcribe speech with embedded Whisper, cut dead space, add captions, transitions, and HyperFrames motion-graphics overlays, reorder tracks, and export at any resolution — entirely over MCP**, while you watch and fine-tune the exact same timeline live in the native editor with shared Undo/Redo history.
 
 ```
-coding agent ──MCP/stdio──▶ openprem-mcp ──┐
-                                          ├──▶ engine ──▶ ffmpeg (NVDEC/NVENC)
-human ───────native window──▶ openprem-ui ─┘       │
-                                                   └──▶ hyperframes CLI (Node)
+AI coding agent ──MCP/stdio──▶ cutpilot-mcp ──┐
+                                              ├──(live IPC)──▶ engine ──▶ ffmpeg (NVDEC/CUDA/NVENC)
+human ──────────native UI────▶ cutpilot-ui  ──┘                  ├──▶ whisper.cpp (embedded STT)
+                                                                 └──▶ hyperframes CLI (Node)
 ```
 
-## What's in the box
+## Workspace layout
 
 | Binary | Purpose |
 |---|---|
-| `openprem-mcp` | Stdio MCP server exposing the full editing registry (~45 tools) |
-| `openprem-ui` | Native egui/wgpu editor: timeline, tracks, preview, inspector, jobs |
+| `cutpilot-mcp` | Stdio MCP server exposing the full editing registry (~50 tools), auto-bridging to a live `cutpilot-ui` session or running standalone headless |
+| `cutpilot-ui` | Native `egui`/`wgpu` desktop editor: multi-track timeline, live preview with real-time A/V + overlay compositing, inspector, Media Bin, MCP panel |
 
 | Crate | Purpose |
 |---|---|
-| `openprem-core` | Tick-exact timeline model + pure command language (no I/O) |
-| `openprem-media` | ffprobe, silence detection, frame extraction, waveform, ASS/SRT, NVENC export planner, HyperFrames sidecar |
-| `openprem-engine` | Single-writer engine: commands, snapshots/undo, jobs, autosave |
+| `cutpilot-core` | Tick-exact timeline document model + pure command application (zero I/O) |
+| `cutpilot-media` | `ffprobe`, silence detection, frame/filmstrip/stream decoders, peak+RMS waveforms, embedded `whisper.cpp`, ASS/SRT captions, NVENC/CUDA export planner, HyperFrames sidecar |
+| `cutpilot-engine` | Single-writer engine: command dispatcher, snapshot undo/redo, atomic batches, Unix-socket IPC bridge, job registry, autosave |
 
 ## Quickstart
 
-### Requirements
+### Prerequisites
 
-- Rust 1.98+
-- FFmpeg with `libx264`, `libass` (AAC muxing is built in) — NVENC/NVDEC used automatically when present
-- Node.js 22+ **only if** you want HyperFrames-generated animations/transition screens
+- **Rust** (stable toolchain, 2021 edition)
+- **FFmpeg & ffprobe** with `libx264` and `libass` (NVIDIA NVENC/NVDEC/CUDA are detected and used automatically when available, with automatic software fallback)
+- **C/C++ build toolchain + CMake + libclang** (for compiling embedded `whisper.cpp`)
+- **Node.js 22+** *(optional — only needed for rendering HyperFrames HTML animations)*
 
-### Build
+### Clone & Build
 
 ```bash
+git clone https://github.com/barrydeen/cutpilot.git
+cd cutpilot
 cargo build --workspace --release
 ```
 
-### Wire it into Claude Code
+### Run the Native Editor
 
-`.mcp.json`:
+```bash
+./target/release/cutpilot-ui
+```
+
+Use **File → New Project… (`Ctrl+N`)**, **File → Open Project… (`Ctrl+O`)**, **Import Media… (`Ctrl+I`)**, or drag & drop any video, audio (`.wav`, `.mp3`, `.flac`, …), or image file straight into the window.
+
+### Connect an MCP Agent (Claude Code, Cursor, Codex, etc.)
+
+Click **● Connect MCP Agent** in the top bar of `cutpilot-ui` for one-click copy/write configs, or add `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "openprem": {
-      "command": "/absolute/path/to/OpenPrem/target/release/openprem-mcp"
+    "cutpilot": {
+      "command": "/absolute/path/to/cutpilot/target/release/cutpilot-mcp"
     }
   }
 }
 ```
 
-Then ask your agent to make an edit. Full workflow guide with the tool catalog:
-**[docs/MCP.md](docs/MCP.md)**.
+When `cutpilot-ui` is open, `cutpilot-mcp` automatically attaches over a local Unix socket so agent edits land live on your timeline. Pass `--standalone` (or `CUTPILOT_STANDALONE=1`) to run headless in-process.
 
-### Run the native editor
+Full agent guide and tool catalog: **[docs/MCP.md](docs/MCP.md)**.
 
-```bash
-cargo run -p openprem-ui --release
-```
+## Highlights
 
-Press **Import media…** in the top bar to bring up your desktop's file chooser
-(XDG portal). Picking media with **no project open creates one automatically**
-beside your files — canvas matched to the footage (rotation-aware), so portrait
-phone video gets a portrait timeline. You can also drop files onto the window,
-type a project directory and press **New**, or paste a media path in the Media
-panel. Scrub the preview, drag clips, split/trim in the inspector, and hit
-**Export MP4**. Every click goes through the same engine commands the agent
-uses.
+- **Real-time multi-track A/V playback & instant scrubbing**: Press **Space** for live streaming playback with multi-track audio mixing (`A1`, `A2`, … with volume & fades) and live alpha-composited video overlays (`V2`, `V3`, …). High-resolution footage builds GPU short-GOP edit proxies, two-tier timeline filmstrips, and peak+RMS audio waveforms automatically in the background.
+- **First-class WAV & multi-track audio**: Import `.wav` (16/24-bit PCM, 32-bit float, mono/stereo) and other audio formats directly via the default file picker or drag-and-drop; preview live mini-waveforms in the Media Bin, drag directly onto any audio track, or use `＋ Audio` / track menus and Inspector audio fade controls.
+- **Built-in Whisper transcription**: `whisper.cpp` is compiled directly into CutPilot (no Python required). Click **🎙 Transcribe** or call `media_transcribe` / `transcript_get` to get timeline-mapped transcripts that stay accurate across trims and cuts, plus one-click captions.
+- **Full timeline editing suite**: Select (`V`), drag-to-move with snapping, edge-drag trim, Razor (`C`), Split (`S`), In/Out (`I`/`O`) + Ripple Cut (`X`), Delete / Ripple Delete, track reorder (`▲`/`▼`), Mute/Hide/Lock, inline captions, and undo/redo history (`Ctrl+Z` / `Ctrl+Shift+Z`).
+- **HyperFrames animated overlays & transitions**: Agents can author HTML/GSAP motion graphics via `hyperframes_create` (rendered to transparent ProRes 4444 MOV or opaque MP4), with a clean UI modal spinner lock while rendering.
+- **Fast NVIDIA GPU export with resolution selection**: Zero-copy CUDA (`NVDEC → scale_cuda/pad_cuda → NVENC`) with H.264/HEVC/AV1 codecs, Fast/Balanced/Quality presets, selectable output resolution (`Match Project`, 4K, 1440p, 1080p, 720p, 480p, Vertical 9:16, Square 1:1, or Custom), `+faststart`, and automatic `ffprobe` verification.
 
-## Feature status (v0.1 MVP)
+## Tick-exact time model
 
-Done:
+All times are 64-bit integer **ticks** (`3,600,000 ticks = 1 second`), which divides cleanly for both integer frame rates (`24`, `25`, `30`, `50`, `60`) and NTSC rates (`23.976`, `29.97`, `59.94`) — eliminating floating-point drift across edits, transcripts, and exports.
 
-- Timeline with multiple video/audio tracks, linked A/V clips from phone footage
-- Import (video/audio/stills), probe, thumbnails, contact sheets, waveforms
-- Silence detection + ripple-delete dead space (agent or one click in the UI)
-- Captions: add/edit/import SRT/VTT, styled burn-in via ASS at export
-- Transitions: fade-through-color at cut points
-- HyperFrames integration: `hyperframes_create` writes a managed composition
-  and renders transparent ProRes 4444 (alpha) overlays or opaque MP4 screens
-  via the `hyperframes` CLI, then auto-inserts the clip when the job completes
-- Export: 4K MP4, NVENC with automatic x264 fallback, CUDA-accelerated decode,
-  AAC audio, `+faststart`, bitrate scaled from the YouTube 4K recommendation,
-  and every output ffprobe-verified before the job reports success
-- Snapshot undo/redo, atomic `commands_batch`, revision checking for agents
-- Preview frames for agents (`preview_frame` returns the composited image)
-
-Roadmap (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
-
-- Real-time playback with audio clocking (preview is scrub-based today)
-- Zero-copy NVDEC→GPU→NVENC compositing pipeline
-- Edit proxies + waveform caching for smooth 4K scrubbing
-- Native crossfades, keyframes, and color management (HDR→SDR today is passthrough)
-
-## Time model
-
-All times are integer **ticks**: 3,600,000 ticks = 1 second. This is frame-exact
-for 23.976/29.97/59.94 NTSC rates *and* integer rates — no floating-point drift
-ever reaches your edit decisions.
-
-## Testing
+## Testing & Verification
 
 ```bash
-cargo test --workspace        # unit + integration (uses ffmpeg to synthesize media)
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+node scripts/check-docs.mjs
 ```
 
-The MCP integration test drives the real binary over stdio JSON-RPC through the
-full workflow, so the agent surface cannot silently regress.
+Integration tests synthesize real media with `ffmpeg` and drive the compiled `cutpilot-mcp` binary over stdio JSON-RPC end-to-end.
+
+## Contributing
+
+Contributions are welcome! See **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** to get started.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see **[LICENSE](LICENSE)**.

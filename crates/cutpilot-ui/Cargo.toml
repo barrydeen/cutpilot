@@ -1,0 +1,25 @@
+[package]
+name = "cutpilot-ui"
+description = "Native GPU-accelerated egui/wgpu desktop video editor for CutPilot with live MCP agent sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "cutpilot-ui"
+path = "src/main.rs"
+
+[dependencies]
+cutpilot-core.workspace = true
+cutpilot-media.workspace = true
+cutpilot-engine.workspace = true
+eframe = "0.37"
+uuid.workspace = true
+serde_json.workspace = true
+rfd = "0.18"
+pollster = "1"

@@ -1,0 +1,23 @@
+[package]
+name = "cutpilot-engine"
+description = "Single-writer editing engine, snapshot undo/redo, live IPC bridge, and background job scheduler for CutPilot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+cutpilot-core.workspace = true
+cutpilot-media.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+base64 = "0.23"
+
+[dev-dependencies]
+tempfile = "3"

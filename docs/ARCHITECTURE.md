@@ -1,8 +1,8 @@
-# OpenPrem architecture
+# CutPilot architecture
 
 ## Design rule #1: one command registry, two equal frontends
 
-`openprem-core` defines a serde-tagged `Command` enum. **Every** semantic
+`cutpilot-core` defines a serde-tagged `Command` enum. **Every** semantic
 action — down to viewer state like the playhead — is a registry command:
 
 - The MCP layer is a thin typed shell over it.
@@ -13,16 +13,16 @@ action — down to viewer state like the playhead — is a registry command:
   table all agree.
 
 ```
-openprem-core    model + pure command application (no I/O, fully tested)
+cutpilot-core    model + pure command application (no I/O, fully tested)
       │
-openprem-media  ffmpeg/ffprobe interop: probe, silence, frames, waveform,
+cutpilot-media  ffmpeg/ffprobe interop: probe, silence, frames, waveform,
       │          ASS/SRT, the pure export-plan builder, the process runner
       │          (progress + cancellation), HyperFrames sidecar
       ▼
-openprem-engine single-writer engine: snapshots (undo), revisions,
+cutpilot-engine single-writer engine: snapshots (undo), revisions,
       │          atomic batches, job registry, autosave, preview compositing
-      ├── openprem-mcp  typed tools → spawn_blocking → engine (stdio)
-      └── openprem-ui   native egui app → engine (in-process)
+      ├── cutpilot-mcp  typed tools → spawn_blocking → engine (stdio)
+      └── cutpilot-ui   native egui app → engine (in-process)
 ```
 
 ## Time
@@ -78,23 +78,30 @@ alpha for overlays, MP4 for opaque screens), and become ordinary assets that
 the engine inserts automatically when a status poll observes the finished
 job. Re-render via `hyperframes_render` after editing the source.
 
-## Performance roadmap (honest current state)
+## Performance & live bridge architecture
 
-Today: NVDEC-acceler decode (`-hwaccel cuda`), NVENC encode with automatic
-fallback, ffmpeg progress parsing, cancellation, and CPU-side preview
-compositing with an LRU frame cache.
-
-Next, in order:
-
-1. **Real-time playback**: audio clock (cpal) drives the video decoder;
-   GOP-aware prefetch around cuts; drop-late frames.
-2. **Edit proxies**: background half-res transcodes (short GOP, NVENC) for
-   instant scrubbing of 4K phone footage; thumbnails + waveform caches.
-3. **Zero-copy GPU pipeline**: NVDEC → CUDA surfaces → Vulkan external
-   memory → wgpu compositor → CUDA → NVENC, with no CPU readback in steady
-   state; the pure export-plan builder stays the source of truth for what
-   renders, while a GPU backend evaluates it.
-4. **AV1/HEVC outputs** and HDR→SDR tone mapping policies.
+- **Live MCP ↔ UI IPC bridge**: `cutpilot-ui` hosts a local Unix domain socket
+  serving its in-memory `Engine`. `cutpilot-mcp` auto-connects when the UI is
+  running so agent edits appear live on the human's timeline with shared undo
+  history (or runs standalone when headless / `CUTPILOT_STANDALONE=1`).
+- **Real-time playback & instant scrubbing**: persistent streaming `ffmpeg`
+  video + audio decoders for smooth Spacebar playback; latest-wins coalesced
+  scrub slot with frame-quantized 64-frame LRU cache, single reused GPU texture,
+  and two-tier fast-seek/exact-seek scrubbing.
+- **Background GPU edit proxies, filmstrips & detailed waveforms**: high-res/long-GOP
+  footage automatically transcodes on NVENC (`p1 ull`, `-g 15 -bf 0`) into
+  `cache/proxies/` alongside disk-cached high-resolution peak+RMS audio waveforms
+  (`cache/waveforms/*.wf2`), progressive two-tier timeline video filmstrip atlases
+  (`cache/filmstrips/*.fs1`) with on-demand zoomed tile decoding, and bin thumbnails.
+- **Built-in Whisper speech-to-text**: `whisper.cpp` is compiled directly into
+  `cutpilot-media` via `whisper-rs` (GGML models auto-download into
+  `~/.cache/cutpilot/whisper` on first use). Stored transcripts persist in
+  `project.json` and dynamically map to current timeline clip positions for both
+  the UI and MCP agents (`media_transcribe`, `transcript_get`, `transcript_to_captions`).
+- **Zero-copy NVIDIA GPU export**: cut-only timelines stay 100% resident on
+  CUDA VRAM (`NVDEC → scale_cuda/pad_cuda → concat → h264_nvenc/hevc_nvenc/av1_nvenc`)
+  with zero PCIe readbacks, cascading cleanly to hybrid NVDEC+NVENC or libx264
+  if needed.
 
 ## Platform
 
