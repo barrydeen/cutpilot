@@ -830,6 +830,8 @@ fn save_filmstrip_bin(path: &Path, strip: &OverviewStripData) -> std::io::Result
 }
 
 fn load_filmstrip_bin(path: &Path) -> Option<OverviewStripData> {
+    const MAX_TILE_DIM: u32 = 256;
+    const MAX_FILMSTRIP_FRAMES: usize = 256;
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 20 || &bytes[0..8] != FS_MAGIC {
         return None;
@@ -837,8 +839,21 @@ fn load_filmstrip_bin(path: &Path) -> Option<OverviewStripData> {
     let tile_w = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     let tile_h = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     let count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
-    let frame_len = tile_w as usize * tile_h as usize * 4;
-    if count == 0 || frame_len == 0 || bytes.len() != 20 + count * (8 + frame_len) {
+    if tile_w == 0
+        || tile_h == 0
+        || tile_w > MAX_TILE_DIM
+        || tile_h > MAX_TILE_DIM
+        || count == 0
+        || count > MAX_FILMSTRIP_FRAMES
+    {
+        return None;
+    }
+    let frame_len = (tile_w as usize)
+        .checked_mul(tile_h as usize)?
+        .checked_mul(4)?;
+    let entry_len = frame_len.checked_add(8)?;
+    let expected = count.checked_mul(entry_len)?.checked_add(20)?;
+    if bytes.len() != expected {
         return None;
     }
     let mut frames = Vec::with_capacity(count);
@@ -854,6 +869,9 @@ fn load_filmstrip_bin(path: &Path) -> Option<OverviewStripData> {
             bytes[off + 6],
             bytes[off + 7],
         ]);
+        if !t.is_finite() || t < 0.0 {
+            return None;
+        }
         off += 8;
         let data = bytes[off..off + frame_len].to_vec();
         off += frame_len;
@@ -864,4 +882,22 @@ fn load_filmstrip_bin(path: &Path) -> Option<OverviewStripData> {
         tile_h,
         frames,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_filmstrip_bin_rejects_overflow_and_corrupt_headers() {
+        let tmp = std::env::temp_dir().join(format!("cutpilot-fs-sec-{}.fs1", Uuid::new_v4()));
+        let mut raw = Vec::new();
+        raw.extend_from_slice(FS_MAGIC);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&tmp, &raw).unwrap();
+        assert!(load_filmstrip_bin(&tmp).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

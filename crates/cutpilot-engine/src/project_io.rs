@@ -77,5 +77,204 @@ pub fn load(path: &Path) -> Result<Project, EngineError> {
         .fps
         .validate()
         .map_err(EngineError::Validation)?;
+    let dir = project_dir(path);
+    validate_loaded_project(&project, &dir)?;
     Ok(project)
+}
+
+fn has_disallowed_protocol_scheme(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    if raw.is_empty() || raw.contains('\0') {
+        return true;
+    }
+    if let Some(colon) = raw.find(':') {
+        let is_windows_drive = colon == 1
+            && raw.as_bytes()[0].is_ascii_alphabetic()
+            && matches!(raw.as_bytes().get(2), Some(b'\\' | b'/'));
+        let prefix = &raw[..colon];
+        let has_path_sep = prefix.contains('/') || prefix.contains('\\');
+        if !is_windows_drive && !has_path_sep {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate structural and security invariants of a deserialized `project.json`
+/// before exposing it to the engine, FFmpeg, or HyperFrames.
+fn validate_loaded_project(project: &Project, project_dir: &Path) -> Result<(), EngineError> {
+    let w = project.settings.width;
+    let h = project.settings.height;
+    if !w.is_multiple_of(2) || !(2..=7680).contains(&w) {
+        return Err(EngineError::Validation(format!(
+            "invalid project width {w} (must be even, 2..=7680)"
+        )));
+    }
+    if !h.is_multiple_of(2) || !(2..=7680).contains(&h) {
+        return Err(EngineError::Validation(format!(
+            "invalid project height {h} (must be even, 2..=7680)"
+        )));
+    }
+    if !(8_000..=384_000).contains(&project.settings.audio_sample_rate) {
+        return Err(EngineError::Validation(format!(
+            "invalid audio_sample_rate {}",
+            project.settings.audio_sample_rate
+        )));
+    }
+
+    let font = project.caption_style.font.trim();
+    if font.is_empty()
+        || font.len() > 128
+        || font
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ',' | '{' | '}' | '\\'))
+    {
+        return Err(EngineError::Validation(
+            "project caption_style.font contains invalid characters".into(),
+        ));
+    }
+    cutpilot_core::commands::validate_hex_color(&project.caption_style.primary_color)
+        .map_err(EngineError::Validation)?;
+    cutpilot_core::commands::validate_hex_color(&project.caption_style.outline_color)
+        .map_err(EngineError::Validation)?;
+
+    let hf_root = cutpilot_media::hyperframes::compositions_dir(project_dir);
+    let hf_root_canon = std::fs::canonicalize(&hf_root).ok();
+
+    for asset in &project.assets {
+        if has_disallowed_protocol_scheme(&asset.path) {
+            return Err(EngineError::Validation(format!(
+                "asset `{}` has disallowed or protocol URI path `{}`",
+                asset.name,
+                asset.path.display()
+            )));
+        }
+        if let Some(gen) = &asset.generated {
+            if has_disallowed_protocol_scheme(&gen.source_dir)
+                || gen
+                    .source_dir
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(EngineError::Validation(format!(
+                    "HyperFrames asset `{}` has unsafe source_dir `{}`",
+                    asset.name,
+                    gen.source_dir.display()
+                )));
+            }
+            if let (Some(root_c), Ok(src_c)) = (&hf_root_canon, std::fs::canonicalize(&gen.source_dir)) {
+                if !src_c.starts_with(root_c) || src_c == *root_c {
+                    return Err(EngineError::Validation(format!(
+                        "HyperFrames asset `{}` source_dir escapes project directory",
+                        asset.name
+                    )));
+                }
+            } else if !gen.source_dir.starts_with(&hf_root) {
+                return Err(EngineError::Validation(format!(
+                    "HyperFrames asset `{}` source_dir `{}` is outside project hyperframes/",
+                    asset.name,
+                    gen.source_dir.display()
+                )));
+            }
+        }
+    }
+
+    for clip in &project.clips {
+        let floats = [
+            clip.opacity,
+            clip.scale,
+            clip.x_offset,
+            clip.y_offset,
+            clip.volume,
+            clip.speed,
+            clip.rotation_deg,
+            clip.crop.left,
+            clip.crop.right,
+            clip.crop.top,
+            clip.crop.bottom,
+            clip.color.brightness,
+            clip.color.contrast,
+            clip.color.saturation,
+            clip.color.gamma,
+            clip.color.blur,
+            clip.color.vignette,
+        ];
+        if !floats.iter().all(|v| v.is_finite()) {
+            return Err(EngineError::Validation(format!(
+                "clip {} contains non-finite numeric parameters",
+                clip.id
+            )));
+        }
+        if !(-32_768.0..=32_768.0).contains(&clip.x_offset)
+            || !(-32_768.0..=32_768.0).contains(&clip.y_offset)
+        {
+            return Err(EngineError::Validation(format!(
+                "clip {} has out-of-range x_offset/y_offset",
+                clip.id
+            )));
+        }
+        if let Some(m) = &clip.motion {
+            if ![
+                m.start_scale,
+                m.end_scale,
+                m.start_pan_x,
+                m.start_pan_y,
+                m.end_pan_x,
+                m.end_pan_y,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return Err(EngineError::Validation(format!(
+                    "clip {} motion contains non-finite values",
+                    clip.id
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cutpilot_core::{Asset, AssetKind, Fps, GeneratedAsset, ProjectSettings};
+
+    #[test]
+    fn load_rejects_remote_asset_uri_and_escaped_hyperframes_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = Project::new("bad", ProjectSettings::default());
+        p.assets.push(Asset {
+            id: uuid::Uuid::new_v4(),
+            kind: AssetKind::Video,
+            name: "ssrf".into(),
+            path: PathBuf::from("http://169.254.169.254/latest/meta-data/"),
+            probe: None,
+            generated: None,
+        });
+        write_atomic(&project_file(tmp.path()), &p).unwrap();
+        assert!(load(tmp.path()).is_err());
+
+        let mut p2 = Project::new("bad-hf", ProjectSettings::default());
+        p2.assets.push(Asset {
+            id: uuid::Uuid::new_v4(),
+            kind: AssetKind::Video,
+            name: "escape".into(),
+            path: tmp.path().join("ok.mov"),
+            probe: None,
+            generated: Some(GeneratedAsset {
+                source_dir: PathBuf::from("/tmp/outside-project"),
+                format: "mov".into(),
+                transparent: true,
+                width: 1920,
+                height: 1080,
+                fps: Fps::from_int(30),
+                duration_ticks: 3_600_000,
+                html: "<div/>".into(),
+            }),
+        });
+        write_atomic(&project_file(tmp.path()), &p2).unwrap();
+        assert!(load(tmp.path()).is_err());
+    }
 }

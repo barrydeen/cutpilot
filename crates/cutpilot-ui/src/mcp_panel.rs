@@ -223,9 +223,9 @@ impl McpPanelState {
                             if let Some(dir) = project_dir {
                                 if ui.button("Write .mcp.json into Project Folder").clicked() {
                                     let dest = dir.join(".mcp.json");
-                                    match std::fs::write(&dest, &mcp_json) {
+                                    match write_or_merge_mcp_json(&dest, &bin_str) {
                                         Ok(_) => self.set_notice(format!(
-                                            "Wrote {}",
+                                            "Updated {}",
                                             dest.display()
                                         )),
                                         Err(e) => self.set_notice(format!("Write failed: {e}")),
@@ -302,6 +302,16 @@ impl McpPanelState {
                         self.set_notice("Copied prompt!");
                     }
                 });
+
+                // Privacy notice for cloud-hosted MCP agents.
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Privacy note: connected MCP agents can read project file paths, speech transcripts, and preview frames from the open timeline.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
 
                 // Live activity log.
                 ui.add_space(8.0);
@@ -391,4 +401,40 @@ fn detect_mcp_binary() -> (PathBuf, bool) {
     }
 
     (PathBuf::from(bin_name), false)
+}
+
+/// Write or safely merge `mcpServers.cutpilot` into `.mcp.json`, refusing to
+/// follow symlinks and preserving any existing MCP server entries.
+fn write_or_merge_mcp_json(dest: &Path, bin_str: &str) -> Result<(), String> {
+    if let Ok(meta) = std::fs::symlink_metadata(dest) {
+        if meta.file_type().is_symlink() {
+            return Err("refusing to write .mcp.json through a symlink".into());
+        }
+    }
+    let mut root: serde_json::Value = if dest.is_file() {
+        let existing = std::fs::read_to_string(dest).map_err(|e| e.to_string())?;
+        serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let servers = root
+        .as_object_mut()
+        .expect("object")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers
+        .as_object_mut()
+        .expect("mcpServers object")
+        .insert(
+            "cutpilot".into(),
+            serde_json::json!({ "command": bin_str }),
+        );
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(dest, out).map_err(|e| e.to_string())
 }

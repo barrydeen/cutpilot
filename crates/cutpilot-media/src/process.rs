@@ -88,13 +88,27 @@ fn pump(
     progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Pumped, MediaError> {
-    // stderr: capture everything for error reporting.
+    // stderr: capture bounded diagnostic output (cap at 256 KiB, draining any
+    // excess so the child never blocks on a full pipe and RAM stays bounded).
     let mut stderr = child.stderr.take().expect("stderr piped");
     let (err_tx, err_rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut buf);
-        let _ = err_tx.send(buf);
+        use std::io::Read;
+        const MAX_STDERR_BYTES: usize = 256 * 1024;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if raw.len() < MAX_STDERR_BYTES {
+                        let take = (MAX_STDERR_BYTES - raw.len()).min(n);
+                        raw.extend_from_slice(&chunk[..take]);
+                    }
+                }
+            }
+        }
+        let _ = err_tx.send(String::from_utf8_lossy(&raw).into_owned());
     });
 
     // stdout: parse `-progress` key=value lines.

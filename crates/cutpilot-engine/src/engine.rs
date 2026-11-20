@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 const HISTORY_LIMIT: usize = 100;
 const JOBS_LIST_LIMIT: usize = 50;
+const MAX_CONCURRENT_JOBS: usize = 4;
 
 struct Snapshot {
     project: Project,
@@ -190,9 +191,13 @@ impl Engine {
                     settings.fps = cutpilot_core::Fps::from_int(30);
                 }
                 settings.fps.validate().map_err(EngineError::Validation)?;
-                if width.unwrap_or(3840) % 2 != 0 || height.unwrap_or(2160) % 2 != 0 {
+                if !settings.width.is_multiple_of(2)
+                    || !(2..=7680).contains(&settings.width)
+                    || !settings.height.is_multiple_of(2)
+                    || !(2..=7680).contains(&settings.height)
+                {
                     return Err(EngineError::Validation(
-                        "width and height must be even numbers".into(),
+                        "width and height must be even numbers between 2 and 7680".into(),
                     ));
                 }
                 let project = Project::new(name.clone(), settings);
@@ -385,14 +390,18 @@ impl Engine {
                 Ok(Outcome::new(self.revision(), &kind, data, "imported media"))
             }
             Command::RemoveAsset { asset_id } => {
-                let active = self.require_active_mut()?;
-                let used = active.project.clips.iter().any(|c| &c.asset_id == asset_id);
-                if used {
-                    return Err(EngineError::Validation(
-                        "asset is used by timeline clips; remove those clips first".into(),
-                    ));
-                }
+                let project_dir = {
+                    let active = self.require_active()?;
+                    let used = active.project.clips.iter().any(|c| &c.asset_id == asset_id);
+                    if used {
+                        return Err(EngineError::Validation(
+                            "asset is used by timeline clips; remove those clips first".into(),
+                        ));
+                    }
+                    active.dir.clone()
+                };
                 let data = self.mutate(&cmd, &kind)?;
+                cleanup_asset_caches(&project_dir, asset_id);
                 Ok(Outcome::new(self.revision(), &kind, data, "removed asset"))
             }
             Command::MediaList {} => {
@@ -575,6 +584,7 @@ impl Engine {
             }
             Command::UpdateHyperFramesSource { asset_id, html } => {
                 let active = self.require_active_mut()?;
+                let project_dir = active.dir.clone();
                 let asset = active
                     .project
                     .assets
@@ -585,8 +595,19 @@ impl Engine {
                     .generated
                     .as_mut()
                     .ok_or_else(|| EngineError::Validation("asset is not a HyperFrames composition".into()))?;
+                let validated_dir =
+                    hyperframes::validate_composition_dir(&project_dir, &generated.source_dir)?;
+                let index_path = validated_dir.join("index.html");
+                if let Ok(meta) = std::fs::symlink_metadata(&index_path) {
+                    if meta.file_type().is_symlink() {
+                        return Err(EngineError::Validation(
+                            "refusing to write HyperFrames index.html through a symlink".into(),
+                        ));
+                    }
+                }
+                generated.source_dir = validated_dir;
                 generated.html = html.clone();
-                std::fs::write(generated.source_dir.join("index.html"), html)?;
+                std::fs::write(&index_path, html)?;
                 let data = json!({"asset_id": asset_id, "source_updated": true});
                 Ok(Outcome::new(self.revision(), &kind, data, "updated composition source"))
             }
@@ -597,10 +618,14 @@ impl Engine {
                     let generated = asset.generated.as_ref().ok_or_else(|| {
                         EngineError::Validation("asset is not a HyperFrames composition".into())
                     })?;
+                    let validated_dir = hyperframes::validate_composition_dir(
+                        &active.dir,
+                        &generated.source_dir,
+                    )?;
                     (
                         asset.name.clone(),
                         generated.transparent,
-                        generated.source_dir.clone(),
+                        validated_dir,
                         generated.duration_ticks,
                         overlay_for_asset(&active.project, asset_id),
                     )
@@ -691,6 +716,7 @@ impl Engine {
                     width: Some(out_w),
                     height: Some(out_h),
                 };
+                self.ensure_job_capacity()?;
                 let (job_id, cancel) = {
                     let mut reg = self.jobs.lock().expect("job registry lock");
                     reg.start("render", &format!("export {out_w}×{out_h} {}", out.display()))
@@ -1108,10 +1134,11 @@ impl Engine {
         }
         if !hyperframes::sidecar_available() {
             return Err(EngineError::Validation(
-                "Node.js `npx` is not available; install Node 22+ to render HyperFrames".into(),
+                "Node.js `npx` or `hyperframes` CLI is not available; install Node 22+ to render HyperFrames".into(),
             ));
         }
-        let dir = hyperframes::scaffold_composition(&active.dir, name, html);
+        self.ensure_job_capacity()?;
+        let dir = hyperframes::scaffold_composition(&active.dir, name, html)?;
         // Placeholder asset; probe fills in when the render lands.
         let asset = Asset {
             id: Uuid::new_v4(),
@@ -1176,6 +1203,7 @@ impl Engine {
         source_dir: PathBuf,
         wait: bool,
     ) -> Result<Value, EngineError> {
+        self.ensure_job_capacity()?;
         let (job_id, cancel) = {
             let mut reg = self.jobs.lock().expect("job registry lock");
             reg.start("hyperframes", &format!("Rendering HyperFrames: {name}"))
@@ -1386,10 +1414,8 @@ impl Engine {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| whisper::DEFAULT_MODEL.to_string());
-        if !Path::new(&model_name).is_file() {
-            whisper::model_filename(&model_name)
-                .map_err(|e| EngineError::Validation(e.to_string()))?;
-        }
+        validate_whisper_model_arg(&model_name)?;
+        self.ensure_job_capacity()?;
 
         let (job_id, cancel) = {
             let mut reg = self.jobs.lock().expect("job registry lock");
@@ -1559,10 +1585,64 @@ impl Engine {
         Ok(())
     }
 
+    fn ensure_job_capacity(&self) -> Result<(), EngineError> {
+        let reg = self.jobs.lock().expect("job registry lock");
+        let active_count = reg.active_jobs_of_kind("render").len()
+            + reg.active_jobs_of_kind("hyperframes").len()
+            + reg.active_jobs_of_kind("transcribe").len();
+        if active_count >= MAX_CONCURRENT_JOBS {
+            return Err(EngineError::Validation(format!(
+                "too many concurrent background jobs ({active_count}/{MAX_CONCURRENT_JOBS}); wait for or cancel an active job first"
+            )));
+        }
+        Ok(())
+    }
+
     fn autosave(active: &ActiveProject) -> Result<(), EngineError> {
         let file = project_io::project_file(&active.dir);
         project_io::write_atomic(&file, &active.project)
     }
+}
+
+/// Remove cached proxy, waveform, and filmstrip derivatives when an asset is
+/// removed from the project so deleted media does not remain on disk.
+fn cleanup_asset_caches(project_dir: &Path, asset_id: &Uuid) {
+    let cache = project_dir.join("cache");
+    let candidates = [
+        cache.join("proxies").join(format!("{asset_id}.mp4")),
+        cache.join("waveforms").join(format!("{asset_id}.wf2")),
+        cache.join("filmstrips").join(format!("{asset_id}.fs1")),
+    ];
+    for p in candidates {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Allow only named Whisper GGML models from `SUPPORTED_MODELS` or `.bin` files
+/// residing strictly inside `whisper::models_dir()`. Prevents arbitrary local
+/// file existence probing and loading untrusted system files into whisper.cpp.
+fn validate_whisper_model_arg(model_name: &str) -> Result<(), EngineError> {
+    if whisper::SUPPORTED_MODELS.contains(&model_name) {
+        return Ok(());
+    }
+    let models_root = whisper::models_dir();
+    if let (Ok(root_canon), Ok(cand_canon)) = (
+        std::fs::canonicalize(&models_root),
+        std::fs::canonicalize(Path::new(model_name)),
+    ) {
+        let is_bin = cand_canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("bin"));
+        if cand_canon.starts_with(&root_canon) && cand_canon.is_file() && is_bin {
+            return Ok(());
+        }
+    }
+    Err(EngineError::Validation(format!(
+        "unsupported Whisper model `{model_name}`; choose one of: {} (or a .bin file inside {})",
+        whisper::SUPPORTED_MODELS.join(", "),
+        models_root.display()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,4 +2024,50 @@ fn timeline_json(project: &Project) -> Value {
             "selection": project.editor.selection,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_project_rejects_zero_or_oversized_dimensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new();
+        for (w, h) in [(0, 1080), (1920, 0), (8000, 1080), (1921, 1080)] {
+            let res = engine.execute(Command::CreateProject {
+                name: "bad".into(),
+                path: tmp.path().join(format!("p-{w}-{h}")),
+                width: Some(w),
+                height: Some(h),
+                fps_num: None,
+                fps_den: None,
+            });
+            assert!(res.is_err(), "expected {w}x{h} to be rejected");
+        }
+    }
+
+    #[test]
+    fn whisper_model_arg_rejects_arbitrary_filesystem_paths() {
+        assert!(validate_whisper_model_arg("base.en").is_ok());
+        assert!(validate_whisper_model_arg("/etc/passwd").is_err());
+        assert!(validate_whisper_model_arg("../../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn cleanup_asset_caches_deletes_proxy_waveform_and_filmstrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let proxy = tmp.path().join("cache/proxies").join(format!("{id}.mp4"));
+        let wf = tmp.path().join("cache/waveforms").join(format!("{id}.wf2"));
+        let fs = tmp.path().join("cache/filmstrips").join(format!("{id}.fs1"));
+        for p in [&proxy, &wf, &fs] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"data").unwrap();
+        }
+        cleanup_asset_caches(tmp.path(), &id);
+        assert!(!proxy.exists());
+        assert!(!wf.exists());
+        assert!(!fs.exists());
+    }
 }

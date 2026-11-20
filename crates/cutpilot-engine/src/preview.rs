@@ -59,8 +59,9 @@ pub fn composite_frame(
             .as_ref()
             .map(|p| p.oriented_size())
             .unwrap_or((project.settings.width, project.settings.height));
-        let ow = ((aw as f64 * clip.scale as f64 * sx).round() as u32).max(2) & !1;
-        let oh = ((ah as f64 * clip.scale as f64 * sy).round() as u32).max(2) & !1;
+        let scale = clip.scale.clamp(0.05, 20.0) as f64;
+        let ow = ((aw as f64 * scale * sx).round() as u32).clamp(2, 3840) & !1;
+        let oh = ((ah as f64 * scale * sy).round() as u32).clamp(2, 2160) & !1;
         let vf = frames::build_clip_preview_vf(clip, ow, oh, sx, sy, ticks, false);
         let over = frames::extract_frame_with_vf(&asset.path, seek, &vf, ow, oh, false, false)?;
         let px = ((pw as f64 - ow as f64) / 2.0 + clip.x_offset as f64 * sx).round() as i64;
