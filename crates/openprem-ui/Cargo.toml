@@ -1,0 +1,17 @@
+[package]
+name = "openprem-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openprem-ui"
+path = "src/main.rs"
+
+[dependencies]
+openprem-core.workspace = true
+openprem-media.workspace = true
+openprem-engine.workspace = true
+eframe = "0.37"
+uuid.workspace = true
+serde_json.workspace = true

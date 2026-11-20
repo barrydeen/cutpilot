@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openprem-core",
+    "crates/openprem-media",
+    "crates/openprem-engine",
+    "crates/openprem-mcp",
+    "crates/openprem-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/openprem/openprem"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+openprem-core = { path = "crates/openprem-core" }
+openprem-media = { path = "crates/openprem-media" }
+openprem-engine = { path = "crates/openprem-engine" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
