@@ -32,7 +32,10 @@ pub fn parse_srt(text: &str, offset_ticks: Ticks) -> Result<Vec<Caption>, String
             line.to_string()
         };
         if !time_line.contains("-->") {
-            return Err(format!("expected a timecode line, found `{time_line}`"));
+            return Err(
+                "invalid SRT/VTT format: expected a timecode line (`HH:MM:SS,mmm --> HH:MM:SS,mmm`)"
+                    .into(),
+            );
         }
         let mut parts = time_line.split("-->");
         let start = parts
@@ -95,11 +98,20 @@ fn parse_timestamp(s: &str) -> Result<Ticks, String> {
         [s] => (0, 0, *s),
         _ => return Err(bad()),
     };
-    if !(0..=59).contains(&m) || !(0..=59).contains(&sec) {
+    if !(0..=999).contains(&h) || !(0..=59).contains(&m) || !(0..=59).contains(&sec) || !(0..=999).contains(&ms) {
         return Err(bad());
     }
-    let total_ms = ((h * 60 + m) * 60 + sec) * 1_000 + ms;
-    Ok(total_ms * (TICKS_PER_SEC / 1_000))
+    let total_ms = h
+        .checked_mul(60)
+        .and_then(|v| v.checked_add(m))
+        .and_then(|v| v.checked_mul(60))
+        .and_then(|v| v.checked_add(sec))
+        .and_then(|v| v.checked_mul(1_000))
+        .and_then(|v| v.checked_add(ms))
+        .ok_or_else(bad)?;
+    total_ms
+        .checked_mul(TICKS_PER_SEC / 1_000)
+        .ok_or_else(bad)
 }
 
 fn srt_timestamp(ticks: Ticks) -> String {
@@ -153,5 +165,15 @@ mod tests {
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].start, TICKS_PER_SEC + TICKS_PER_SEC / 2);
         assert_eq!(caps[0].end, TICKS_PER_SEC * 2);
+    }
+
+    #[test]
+    fn parse_srt_does_not_leak_non_srt_file_contents_and_rejects_overflow() {
+        let err = parse_srt("SECRET_API_KEY=super-secret-value\n", 0).unwrap_err();
+        assert!(
+            !err.contains("SECRET_API_KEY") && !err.contains("super-secret-value"),
+            "error must not echo arbitrary file contents: {err}"
+        );
+        assert!(parse_srt("1\n999999999999:00:00,000 --> 999999999999:00:01,000\nhi\n", 0).is_err());
     }
 }

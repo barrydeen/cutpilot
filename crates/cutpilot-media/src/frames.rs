@@ -189,6 +189,14 @@ pub fn extract_frame_with_vf(
     extract_frame_with_filter(path, time_secs, vf, out_w, out_h, fast_seek, false)
 }
 
+fn checked_rgba_len(w: u32, h: u32) -> Result<usize, MediaError> {
+    (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4))
+        .filter(|&n| n > 0 && n <= 256 * 1024 * 1024)
+        .ok_or_else(|| MediaError::BadData(format!("invalid frame dimensions {w}x{h}")))
+}
+
 fn extract_frame_with_filter(
     path: &Path,
     time_secs: f64,
@@ -198,6 +206,8 @@ fn extract_frame_with_filter(
     fast_seek: bool,
     hwaccel_cuda: bool,
 ) -> Result<RgbaFrame, MediaError> {
+    let expected = checked_rgba_len(out_w, out_h)?;
+    let safe_path = crate::safe_local_input(path)?;
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error"]);
     if hwaccel_cuda {
@@ -208,8 +218,9 @@ fn extract_frame_with_filter(
     }
     cmd.arg("-ss")
         .arg(fmt_secs(time_secs.max(0.0)))
+        .args(["-protocol_whitelist", crate::LOCAL_FILE_PROTOCOL_WHITELIST])
         .arg("-i")
-        .arg(path)
+        .arg(&safe_path)
         .args(["-frames:v", "1", "-vf"])
         .arg(vf)
         .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
@@ -227,7 +238,6 @@ fn extract_frame_with_filter(
             ),
         });
     }
-    let expected = out_w as usize * out_h as usize * 4;
     if output.stdout.len() != expected {
         return Err(MediaError::BadData(format!(
             "frame decode produced {} bytes, expected {expected}",
@@ -294,6 +304,8 @@ impl VideoStreamDecoder {
         vf: &str,
         use_hwaccel: bool,
     ) -> Result<Self, MediaError> {
+        let frame_bytes = checked_rgba_len(out_w, out_h)?;
+        let safe_path = crate::safe_local_input(path)?;
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-v", "error"]);
         if use_hwaccel && crate::gpu::capabilities().nvdec {
@@ -305,8 +317,9 @@ impl VideoStreamDecoder {
                 cmd.arg("-t").arg(fmt_secs(dur));
             }
         }
-        cmd.arg("-i")
-            .arg(path)
+        cmd.args(["-protocol_whitelist", crate::LOCAL_FILE_PROTOCOL_WHITELIST])
+            .arg("-i")
+            .arg(&safe_path)
             .args(["-an", "-sn", "-dn", "-vf"])
             .arg(vf)
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
@@ -323,7 +336,7 @@ impl VideoStreamDecoder {
             stdout,
             width: out_w,
             height: out_h,
-            frame_bytes: out_w as usize * out_h as usize * 4,
+            frame_bytes,
         })
     }
 
@@ -340,6 +353,8 @@ impl VideoStreamDecoder {
         fps_num: u32,
         fps_den: u32,
     ) -> Result<Self, MediaError> {
+        let frame_bytes = checked_rgba_len(out_w, out_h)?;
+        let safe_path = crate::safe_local_input(path)?;
         let vf = format!(
             "scale={w}:{h}:flags=fast_bilinear,setsar=1,format=rgba,fps={fn_}/{fd}",
             w = out_w,
@@ -355,8 +370,9 @@ impl VideoStreamDecoder {
                 cmd.arg("-t").arg(fmt_secs(dur));
             }
         }
-        cmd.arg("-i")
-            .arg(path)
+        cmd.args(["-protocol_whitelist", crate::LOCAL_FILE_PROTOCOL_WHITELIST])
+            .arg("-i")
+            .arg(&safe_path)
             .args(["-an", "-sn", "-dn", "-vf"])
             .arg(vf)
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
@@ -373,7 +389,7 @@ impl VideoStreamDecoder {
             stdout,
             width: out_w,
             height: out_h,
-            frame_bytes: out_w as usize * out_h as usize * 4,
+            frame_bytes,
         })
     }
 
@@ -429,6 +445,7 @@ impl AudioStreamDecoder {
         volume: f32,
         speed: f32,
     ) -> Result<Self, MediaError> {
+        let safe_path = crate::safe_local_input(path)?;
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-v", "error", "-ss"])
             .arg(fmt_secs(start_secs.max(0.0)));
@@ -437,8 +454,9 @@ impl AudioStreamDecoder {
                 cmd.arg("-t").arg(fmt_secs(dur));
             }
         }
-        cmd.arg("-i")
-            .arg(path)
+        cmd.args(["-protocol_whitelist", crate::LOCAL_FILE_PROTOCOL_WHITELIST])
+            .arg("-i")
+            .arg(&safe_path)
             .args(["-vn", "-sn", "-dn"]);
         let mut af_parts = Vec::new();
         let atempo = crate::export::atempo_chain(speed);
@@ -572,11 +590,14 @@ pub fn paste_rgba(
 
 /// JPEG thumbnail of a single frame.
 pub fn thumbnail_jpeg(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>, MediaError> {
+    let safe_path = crate::safe_local_input(path)?;
+    let max_width = max_width.clamp(16, 3840);
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-ss"])
         .arg(fmt_secs(time_secs.max(0.0)))
+        .args(["-protocol_whitelist", crate::LOCAL_FILE_PROTOCOL_WHITELIST])
         .arg("-i")
-        .arg(path)
+        .arg(&safe_path)
         .args(["-frames:v", "1", "-vf"])
         .arg(format!("scale='min({m},iw)':-2", m = max_width))
         .args(["-q:v", "4", "-f", "image2pipe", "pipe:1"])
@@ -591,6 +612,7 @@ pub fn thumbnail_jpeg(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec
 
 /// Contact sheet: `count` evenly spaced frames in a JPEG grid.
 pub fn contact_sheet_jpeg(path: &Path, count: u32) -> Result<Vec<u8>, MediaError> {
+    let safe_path = crate::safe_local_input(path)?;
     let probe = crate::ffprobe::probe(path)?;
     let duration = cutpilot_core::secs_from_ticks(probe.probe.duration_ticks);
     let count = count.clamp(2, 24);
@@ -602,8 +624,14 @@ pub fn contact_sheet_jpeg(path: &Path, count: u32) -> Result<Vec<u8>, MediaError
         "fps=1".to_string()
     };
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            crate::LOCAL_FILE_PROTOCOL_WHITELIST,
+            "-i",
+        ])
+        .arg(&safe_path)
         .arg("-vf")
         .arg(format!(
             "select='isnan(prev_selected_t)+gte(t-prev_selected_t,{dur}/{n})',{fps},scale=480:-2,tile={cols}x{rows}",

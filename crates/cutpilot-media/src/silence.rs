@@ -31,14 +31,26 @@ pub fn detect_silence(
     duration_ticks: Ticks,
     opts: &SilenceOptions,
 ) -> Result<Vec<TimeRange>, String> {
+    if !opts.threshold_db.is_finite() || !(-120.0..=0.0).contains(&opts.threshold_db) {
+        return Err("threshold_db must be finite and between -120 and 0".into());
+    }
+    if !opts.min_duration_secs.is_finite() || !(0.01..=3600.0).contains(&opts.min_duration_secs) {
+        return Err("min_duration_secs must be finite and between 0.01 and 3600".into());
+    }
+    if !opts.padding_secs.is_finite() || !(0.0..=60.0).contains(&opts.padding_secs) {
+        return Err("padding_secs must be finite and between 0 and 60".into());
+    }
+    let safe_path = crate::safe_local_input(path).map_err(|e| e.to_string())?;
     let output = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-nostats",
             "-vn",
+            "-protocol_whitelist",
+            crate::LOCAL_FILE_PROTOCOL_WHITELIST,
             "-i",
         ])
-        .arg(path)
+        .arg(&safe_path)
         .arg("-af")
         .arg(format!(
             "silencedetect=noise={:.1}dB:d={:.3}",
@@ -101,12 +113,12 @@ fn apply_padding(
     if padding_secs <= 0.0 {
         return ranges;
     }
-    let pad = (padding_secs * TICKS_PER_SEC as f64).round() as Ticks;
+    let pad = (padding_secs.clamp(0.0, 60.0) * TICKS_PER_SEC as f64).round() as Ticks;
     let mut padded: Vec<TimeRange> = ranges
         .into_iter()
         .map(|r| TimeRange {
-            start: (r.start - pad).max(0),
-            end: (r.end + pad).min(duration_ticks),
+            start: r.start.saturating_sub(pad).max(0),
+            end: r.end.saturating_add(pad).min(duration_ticks),
         })
         .collect();
     // Merge ranges that now overlap after padding.
@@ -171,5 +183,20 @@ mod tests {
             TICKS_PER_SEC + TICKS_PER_SEC / 4
         );
         assert_eq!(merged[0].end, (TICKS_PER_SEC * 6) + (TICKS_PER_SEC * 3 / 4));
+    }
+
+    #[test]
+    fn detect_silence_rejects_non_finite_or_remote_inputs() {
+        let bad_opts = SilenceOptions {
+            threshold_db: f32::NAN,
+            ..Default::default()
+        };
+        assert!(detect_silence(Path::new("/tmp/a.mp4"), TICKS_PER_SEC, &bad_opts).is_err());
+        assert!(detect_silence(
+            Path::new("http://example.com/a.mp4"),
+            TICKS_PER_SEC,
+            &SilenceOptions::default()
+        )
+        .is_err());
     }
 }
