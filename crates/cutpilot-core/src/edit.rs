@@ -611,6 +611,16 @@ pub fn apply_edit(project: &mut Project, cmd: &Command) -> Result<Value, CoreErr
                     return Err(invalid("rotation_deg must be between -360 and 360"));
                 }
             }
+            if let Some(v) = x_offset {
+                if !v.is_finite() || !(-32_768.0..=32_768.0).contains(v) {
+                    return Err(invalid("x_offset must be finite and between -32768 and 32768"));
+                }
+            }
+            if let Some(v) = y_offset {
+                if !v.is_finite() || !(-32_768.0..=32_768.0).contains(v) {
+                    return Err(invalid("y_offset must be finite and between -32768 and 32768"));
+                }
+            }
             if let Some(c) = crop {
                 validate_crop(c)?;
             }
@@ -1410,8 +1420,20 @@ fn validate_caption_style(style: &CaptionStyle) -> Result<(), CoreError> {
     if !(1..=9).contains(&style.alignment) {
         return Err(invalid("caption alignment must be 1..9 (ASS numpad)"));
     }
-    if style.font.trim().is_empty() {
+    let font = style.font.trim();
+    if font.is_empty() {
         return Err(invalid("caption font cannot be empty"));
+    }
+    if font.len() > 128 {
+        return Err(invalid("caption font name exceeds 128 bytes"));
+    }
+    if font
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ',' | '{' | '}' | '\\'))
+    {
+        return Err(invalid(
+            "caption font name contains invalid characters (commas, braces, backslashes, or control characters)",
+        ));
     }
     Ok(())
 }
@@ -1949,5 +1971,61 @@ mod tests {
 
         apply_edit(&mut p, &Command::RemoveMarker { marker_id: m2_id }).unwrap();
         assert!(p.markers.is_empty());
+    }
+
+    #[test]
+    fn rejects_ass_injection_in_caption_font_and_non_finite_offsets() {
+        let (mut p, _asset, vid, _aud) = project_with_clip();
+        for bad_font in [
+            "Sans\n[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,x",
+            "Sans,99",
+            "Sans{bad}",
+            "Sans\\N",
+        ] {
+            let style = CaptionStyle {
+                font: bad_font.into(),
+                ..CaptionStyle::default()
+            };
+            assert!(
+                apply_edit(&mut p, &Command::SetCaptionStyle { style }).is_err(),
+                "expected font `{bad_font}` to be rejected"
+            );
+        }
+        assert!(apply_edit(
+            &mut p,
+            &Command::UpdateClip {
+                clip_id: vid,
+                volume: None,
+                opacity: None,
+                scale: None,
+                x_offset: Some(f32::NAN),
+                y_offset: None,
+                fade_in_ticks: None,
+                fade_out_ticks: None,
+                rotation_deg: None,
+                flip_h: None,
+                flip_v: None,
+                crop: None,
+            }
+        )
+        .is_err());
+        assert!(apply_edit(
+            &mut p,
+            &Command::UpdateClip {
+                clip_id: vid,
+                volume: None,
+                opacity: None,
+                scale: None,
+                x_offset: None,
+                y_offset: Some(1_000_000.0),
+                fade_in_ticks: None,
+                fade_out_ticks: None,
+                rotation_deg: None,
+                flip_h: None,
+                flip_v: None,
+                crop: None,
+            }
+        )
+        .is_err());
     }
 }

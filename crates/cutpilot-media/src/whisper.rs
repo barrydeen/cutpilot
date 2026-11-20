@@ -193,19 +193,46 @@ pub fn resolve_or_download_model(
     }
 
     std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let url = model_download_url(trimmed)?;
-    let resp = ureq::get(&url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .redirects(5)
+        .build();
+    let resp = agent
+        .get(&url)
         .call()
         .map_err(|e| MediaError::BadData(format!("failed to download Whisper model `{trimmed}` from {url}: {e}")))?;
+    if !resp.get_url().starts_with("https://") {
+        return Err(MediaError::BadData(format!(
+            "refusing non-HTTPS redirect while downloading Whisper model `{trimmed}`"
+        )));
+    }
 
+    const MAX_MODEL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     let total_bytes: Option<u64> = resp
         .header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0);
+    if total_bytes.is_some_and(|n| n > MAX_MODEL_BYTES) {
+        return Err(MediaError::BadData(format!(
+            "Whisper model `{trimmed}` exceeds maximum allowed download size"
+        )));
+    }
 
     let tmp_path = dir.join(format!("{fname}.{}.part", uuid::Uuid::new_v4()));
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&tmp_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
 
@@ -219,8 +246,15 @@ pub fn resolve_or_download_model(
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n])?;
         written += n as u64;
+        if written > MAX_MODEL_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(MediaError::BadData(format!(
+                "downloaded Whisper model `{trimmed}` exceeded maximum allowed size"
+            )));
+        }
+        file.write_all(&buf[..n])?;
         if let (Some(cb), Some(total)) = (progress, total_bytes) {
             let frac = (written as f64 / total as f64).clamp(0.0, 1.0);
             cb(frac * 0.15);
@@ -241,9 +275,20 @@ pub fn resolve_or_download_model(
 
 /// Extract 16 kHz mono 32-bit float PCM from any media file using `ffmpeg`.
 pub fn extract_pcm_16k_mono(path: &Path, cancel: &Arc<AtomicBool>) -> Result<Vec<f32>, MediaError> {
+    // Cap decoded PCM at 6 hours @ 16 kHz (~1.38 GiB) to prevent OOM on
+    // malformed or infinite media streams.
+    const MAX_PCM_SAMPLES: usize = 16_000 * 60 * 60 * 6;
+    let safe_path = crate::safe_local_input(path)?;
     let mut child = Command::new("ffmpeg")
-        .args(["-hide_banner", "-v", "error", "-i"])
-        .arg(path)
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            crate::LOCAL_FILE_PROTOCOL_WHITELIST,
+            "-i",
+        ])
+        .arg(&safe_path)
         .args([
             "-map",
             "0:a:0",
@@ -290,6 +335,14 @@ pub fn extract_pcm_16k_mono(path: &Path, cancel: &Arc<AtomicBool>) -> Result<Vec
             }
         }
         let (chunks, tail) = slice.as_chunks::<4>();
+        if samples.len().saturating_add(chunks.len()) > MAX_PCM_SAMPLES {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::BadData(
+                "audio stream exceeds maximum supported length for in-memory Whisper transcription"
+                    .into(),
+            ));
+        }
         samples.reserve(chunks.len());
         for &c in chunks {
             samples.push(f32::from_le_bytes(c));
@@ -399,8 +452,11 @@ pub fn transcribe_file(
         if user_data.is_null() {
             return false;
         }
-        let flag = unsafe { &*(user_data as *const AtomicBool) };
-        flag.load(Ordering::Relaxed)
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let flag = unsafe { &*(user_data as *const AtomicBool) };
+            flag.load(Ordering::Relaxed)
+        }))
+        .unwrap_or(true)
     }
 
     unsafe extern "C" fn progress_trampoline(
@@ -412,9 +468,11 @@ pub fn transcribe_file(
         if user_data.is_null() {
             return;
         }
-        let carrier = unsafe { &*(user_data as *const ProgressCarrier<'_>) };
-        let frac = (pct.clamp(0, 100) as f64) / 100.0;
-        (carrier.cb)(0.22 + frac * 0.77);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let carrier = unsafe { &*(user_data as *const ProgressCarrier<'_>) };
+            let frac = (pct.clamp(0, 100) as f64) / 100.0;
+            (carrier.cb)(0.22 + frac * 0.77);
+        }));
     }
 
     let cancel_ptr: *const AtomicBool = Arc::as_ptr(&cancel);

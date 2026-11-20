@@ -63,6 +63,7 @@ const IMAGE_CODECS: &[&str] = &[
 
 /// Run ffprobe and parse the result.
 pub fn probe(path: &Path) -> Result<ProbeResult, MediaError> {
+    let safe_path = crate::safe_local_input(path)?;
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -71,8 +72,11 @@ pub fn probe(path: &Path) -> Result<ProbeResult, MediaError> {
             "json",
             "-show_format",
             "-show_streams",
+            "-protocol_whitelist",
+            crate::LOCAL_FILE_PROTOCOL_WHITELIST,
+            "-i",
         ])
-        .arg(path)
+        .arg(&safe_path)
         .output()
         .map_err(|e| MediaError::Probe {
             path: path.display().to_string(),

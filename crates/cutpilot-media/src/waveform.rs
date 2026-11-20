@@ -33,9 +33,16 @@ pub fn recommended_buckets(duration_secs: f64) -> u32 {
 /// Extract up to `buckets` min/max/RMS peaks from the first audio stream.
 pub fn waveform_peaks(path: &Path, buckets: u32) -> Result<Vec<Peak>, String> {
     let buckets = buckets.clamp(16, 131_072) as usize;
+    let safe_path = crate::safe_local_input(path).map_err(|e| e.to_string())?;
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            crate::LOCAL_FILE_PROTOCOL_WHITELIST,
+            "-i",
+        ])
+        .arg(&safe_path)
         .args([
             "-map",
             "0:a:0",
@@ -225,12 +232,17 @@ pub fn save_peaks_bin(path: &Path, peaks: &[Peak]) -> std::io::Result<()> {
 
 /// Load waveform peaks from a binary cache file written by [`save_peaks_bin`].
 pub fn load_peaks_bin(path: &Path) -> Option<Vec<Peak>> {
+    const MAX_CACHED_PEAKS: usize = 262_144;
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 12 || &bytes[0..8] != WF_MAGIC {
         return None;
     }
     let count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    if bytes.len() != 12 + count * 12 {
+    if count > MAX_CACHED_PEAKS {
+        return None;
+    }
+    let expected = count.checked_mul(12)?.checked_add(12)?;
+    if bytes.len() != expected {
         return None;
     }
     let mut peaks = Vec::with_capacity(count);
@@ -249,7 +261,14 @@ pub fn load_peaks_bin(path: &Path) -> Option<Vec<Peak>> {
             bytes[off + 10],
             bytes[off + 11],
         ]);
-        peaks.push(Peak { min, max, rms });
+        if !min.is_finite() || !max.is_finite() || !rms.is_finite() {
+            return None;
+        }
+        peaks.push(Peak {
+            min: min.clamp(-1.0, 1.0),
+            max: max.clamp(-1.0, 1.0),
+            rms: rms.clamp(0.0, 1.0),
+        });
         off += 12;
     }
     Some(peaks)
@@ -299,5 +318,26 @@ mod tests {
         save_peaks_bin(&file, &peaks).unwrap();
         let loaded = load_peaks_bin(&file).unwrap();
         assert_eq!(loaded, peaks);
+    }
+
+    #[test]
+    fn binary_cache_rejects_overflow_and_non_finite_peaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let overflow = dir.path().join("overflow.wf2");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(WF_MAGIC);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&overflow, &raw).unwrap();
+        assert!(load_peaks_bin(&overflow).is_none());
+
+        let nan_file = dir.path().join("nan.wf2");
+        let mut nan_raw = Vec::new();
+        nan_raw.extend_from_slice(WF_MAGIC);
+        nan_raw.extend_from_slice(&1u32.to_le_bytes());
+        nan_raw.extend_from_slice(&f32::NAN.to_le_bytes());
+        nan_raw.extend_from_slice(&0.5f32.to_le_bytes());
+        nan_raw.extend_from_slice(&0.2f32.to_le_bytes());
+        std::fs::write(&nan_file, &nan_raw).unwrap();
+        assert!(load_peaks_bin(&nan_file).is_none());
     }
 }

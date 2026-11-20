@@ -35,6 +35,27 @@ fn escape_ass_text(text: &str) -> String {
         .replace('\n', "\\N")
 }
 
+/// Validate caption font name against ASS section/field injection.
+fn validate_ass_font(font: &str) -> Result<&str, String> {
+    let trimmed = font.trim();
+    if trimmed.is_empty() {
+        return Err("caption font cannot be empty".into());
+    }
+    if trimmed.len() > 128 {
+        return Err("caption font name exceeds 128 bytes".into());
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ',' | '{' | '}' | '\\'))
+    {
+        return Err(
+            "caption font contains disallowed ASS characters (commas, braces, backslashes, or control characters)"
+                .into(),
+        );
+    }
+    Ok(trimmed)
+}
+
 /// Full ASS document for the project's captions, in timeline time.
 pub fn generate_ass(
     style: &CaptionStyle,
@@ -42,6 +63,7 @@ pub fn generate_ass(
     width: u32,
     height: u32,
 ) -> Result<String, String> {
+    let font = validate_ass_font(&style.font)?;
     let primary = hex_to_ass_color(&style.primary_color)?;
     let outline = hex_to_ass_color(&style.outline_color)?;
     let mut s = String::new();
@@ -55,7 +77,7 @@ pub fn generate_ass(
     s.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
     s.push_str(&format!(
         "Style: CutPilot,{font},{size},{primary},&H000000FF,{outline},&H80000000,0,0,0,0,100,100,0,0,1,{outline_w},0,{align},80,80,{margin},1\n\n",
-        font = style.font,
+        font = font,
         size = style.font_size,
         primary = primary,
         outline = outline,
@@ -100,5 +122,24 @@ mod tests {
         assert!(ass.contains("PlayResX: 3840"));
         assert!(ass.contains("Dialogue: 0,0:00:01.00,0:00:03.00,CutPilot,,0,0,0,,Hello\\Nworld"));
         assert!(ass.contains("Style: CutPilot,Sans,64,&H00FFFFFF"));
+    }
+
+    #[test]
+    fn generate_ass_rejects_injected_font() {
+        for bad in [
+            "Sans\n[Events]\nDialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,pwn",
+            "Sans,99",
+            "Sans{override}",
+            "   ",
+        ] {
+            let style = CaptionStyle {
+                font: bad.into(),
+                ..CaptionStyle::default()
+            };
+            assert!(
+                generate_ass(&style, &[], 1920, 1080).is_err(),
+                "expected font `{bad}` to be rejected"
+            );
+        }
     }
 }

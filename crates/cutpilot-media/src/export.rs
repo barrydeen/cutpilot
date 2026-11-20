@@ -185,15 +185,15 @@ pub fn default_bitrate_mbps(project: &Project) -> f64 {
 }
 
 enum InputSpec {
-    /// Seekable media: `[hwaccel] -ss start -t dur -i path`.
+    /// Seekable media: `[hwaccel] -ss start -t dur -protocol_whitelist file -i path`.
     Media {
-        path: PathBuf,
+        path: String,
         seek: Option<(f64, f64)>,
         hw_cuda: bool,
         cuda_surfaces: bool,
     },
-    /// Still image: `-loop 1 -t dur -i path`.
-    Still { path: PathBuf, dur: f64 },
+    /// Still image: `-loop 1 -t dur -protocol_whitelist file -i path`.
+    Still { path: String, dur: f64 },
     /// Generated solid black canvas for audio-only timelines.
     Color {
         width: u32,
@@ -229,8 +229,10 @@ impl InputSpec {
                     args.push("-t".into());
                     args.push(fmt_secs(*dur));
                 }
+                args.push("-protocol_whitelist".into());
+                args.push(crate::LOCAL_FILE_PROTOCOL_WHITELIST.into());
                 args.push("-i".into());
-                args.push(path.display().to_string());
+                args.push(path.clone());
                 args
             }
             InputSpec::Still { path, dur } => vec![
@@ -238,8 +240,10 @@ impl InputSpec {
                 "1".into(),
                 "-t".into(),
                 fmt_secs(*dur),
+                "-protocol_whitelist".into(),
+                crate::LOCAL_FILE_PROTOCOL_WHITELIST.into(),
                 "-i".into(),
-                path.display().to_string(),
+                path.clone(),
             ],
             InputSpec::Color {
                 width,
@@ -489,13 +493,14 @@ pub fn build_export_plan(
                 .as_ref()
                 .map(|p| gpu::nvdec_supported_codec(p.video_codec.as_deref()))
                 .unwrap_or(false);
+        let safe_path = crate::safe_local_input(&asset.path).map_err(|e| e.to_string())?;
         let input = match asset.kind {
             AssetKind::Image => InputSpec::Still {
-                path: asset.path.clone(),
+                path: safe_path,
                 dur: tl_dur,
             },
             _ => InputSpec::Media {
-                path: asset.path.clone(),
+                path: safe_path,
                 seek: Some((cutpilot_core::secs_from_ticks(clip.source_in), src_dur)),
                 hw_cuda: clip_nvdec,
                 cuda_surfaces: gpu_resident,
@@ -627,13 +632,14 @@ pub fn build_export_plan(
             let (pw, ph) = overlay_dims(project, clip, sx, sy);
             let start = cutpilot_core::secs_from_ticks(gap_map.map(clip.timeline_start));
             let end = cutpilot_core::secs_from_ticks(gap_map.map(clip.timeline_end()));
+            let safe_path = crate::safe_local_input(&asset.path).map_err(|e| e.to_string())?;
             let input = match asset.kind {
                 AssetKind::Image => InputSpec::Still {
-                    path: asset.path.clone(),
+                    path: safe_path,
                     dur: tl_dur,
                 },
                 _ => InputSpec::Media {
-                    path: asset.path.clone(),
+                    path: safe_path,
                     seek: Some((cutpilot_core::secs_from_ticks(clip.source_in), src_dur)),
                     hw_cuda: false,
                     cuda_surfaces: false,
@@ -748,12 +754,13 @@ pub fn build_export_plan(
             if vol == 0.0 {
                 continue;
             }
+            let safe_path = crate::safe_local_input(&asset.path).map_err(|e| e.to_string())?;
             let input = match asset.kind {
                 AssetKind::Image => {
                     return Err("images cannot be placed on audio tracks".into());
                 }
                 _ => InputSpec::Media {
-                    path: asset.path.clone(),
+                    path: safe_path,
                     seek: Some((cutpilot_core::secs_from_ticks(clip.source_in), src_dur)),
                     hw_cuda: false,
                     cuda_surfaces: false,
@@ -884,6 +891,10 @@ pub fn build_export_plan(
     args.push(format!("{}k", opts.audio_bitrate_kbps));
     args.push("-ar".into());
     args.push(format!("{sr}"));
+    // Strip source container metadata (e.g., smartphone GPS coordinates, device
+    // model, recording timestamps) so private metadata is not silently embedded.
+    args.push("-map_metadata".into());
+    args.push("-1".into());
     args.push("-movflags".into());
     args.push("+faststart".into());
     args.push("-y".into());
@@ -1084,9 +1095,18 @@ fn overlay_dims(project: &Project, clip: &Clip, sx: f64, sy: f64) -> (u32, u32) 
 }
 
 fn escape_filter_path(path: &str) -> String {
-    path.replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '\\' | ':' | '\'' | ',' | ';' | '[' | ']' | '=' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\r' | '\n' | '\0' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Maps timeline ticks to export seconds when base-track gaps collapse.
@@ -1145,6 +1165,14 @@ pub fn detect_nvenc() -> bool {
     gpu::capabilities().nvenc_h264
 }
 
+struct TempAssDir(PathBuf);
+
+impl Drop for TempAssDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Run the export end to end: write the ASS sidecar, run ffmpeg with
 /// progress/cancel, cascade through GPU fallbacks cleanly, and verify the
 /// output against the plan.
@@ -1160,13 +1188,21 @@ pub fn export_project(
         .map(|t| project.clips_on_track(&t.id))
         .unwrap_or_default();
 
+    let mut ass_dir_guard: Option<TempAssDir> = None;
     let mut ass_path: Option<PathBuf> = None;
     if !project.captions.is_empty() {
-        let dir = out
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!("cutpilot-ass-{}.ass", uuid::Uuid::new_v4()));
+        // Place the temporary ASS sidecar in a dedicated private temp directory
+        // with a strictly alphanumeric UUID name rather than `out.parent()`, so
+        // special characters in user output paths cannot reach the filtergraph
+        // and captions are cleaned up reliably on exit or panic.
+        let dir = std::env::temp_dir().join(format!("cutpilot-ass-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = dir.join("captions.ass");
         let ass_doc = ass::generate_ass(
             &project.caption_style,
             &remapped_captions(project, &base_clips),
@@ -1175,6 +1211,12 @@ pub fn export_project(
         )
         .map_err(MediaError::BadData)?;
         std::fs::write(&path, ass_doc)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        ass_dir_guard = Some(TempAssDir(dir));
         ass_path = Some(path);
     }
     let result = run_export_with_sidecar(
@@ -1185,9 +1227,7 @@ pub fn export_project(
         progress,
         cancel,
     );
-    if let Some(p) = &ass_path {
-        let _ = std::fs::remove_file(p);
-    }
+    drop(ass_dir_guard);
     result
 }
 
@@ -1405,9 +1445,29 @@ mod tests {
         assert!(joined.contains("libx264"));
         assert!(!joined.contains("h264_nvenc"));
         assert!(joined.contains("+faststart"));
+        assert!(joined.contains("-map_metadata -1"));
+        assert!(joined.contains("-protocol_whitelist file -i /tmp/one.mp4"));
         assert_eq!(
             plan.expected_duration_ticks,
             cutpilot_core::ticks_from_secs(20.0)
+        );
+    }
+
+    #[test]
+    fn plan_rejects_remote_uri_and_escapes_filter_metacharacters() {
+        let mut p = Project::new("t", ProjectSettings::default());
+        let mut remote = asset("evil", 5.0, false);
+        remote.path = "https://169.254.169.254/latest/meta-data/".into();
+        let id = remote.id;
+        p.assets.push(remote);
+        p.clips.push(base_clip(&p, id, 0, 5));
+        let err = build_export_plan(&p, Path::new("/tmp/out.mp4"), None, &ExportOptions::default())
+            .unwrap_err();
+        assert!(err.contains("not allowed"), "unexpected err: {err}");
+
+        assert_eq!(
+            escape_filter_path("/tmp/a,b;c[0]=1:d'e\\f\n.ass"),
+            "/tmp/a\\,b\\;c\\[0\\]\\=1\\:d\\'e\\\\f.ass"
         );
     }
 

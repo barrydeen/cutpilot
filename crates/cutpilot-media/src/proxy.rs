@@ -58,6 +58,7 @@ pub fn generate_proxy(
     if dest.is_file() {
         return Ok(dest.to_path_buf());
     }
+    let _ = crate::safe_local_input(source)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -127,7 +128,13 @@ pub fn build_proxy_args(
     if use_nvdec {
         args.extend(["-hwaccel".into(), "cuda".into()]);
     }
-    args.extend(["-i".into(), source.display().to_string()]);
+    let safe_source = crate::safe_local_input(source).unwrap_or_else(|_| source.display().to_string());
+    args.extend([
+        "-protocol_whitelist".into(),
+        crate::LOCAL_FILE_PROTOCOL_WHITELIST.into(),
+        "-i".into(),
+        safe_source,
+    ]);
     // Scale longest side to PROXY_MAX_DIM, keep even dimensions, auto-rotate handled by ffmpeg.
     let vf = format!(
         "scale='if(gte(iw,ih),min({m},iw),-2)':'if(gte(iw,ih),-2,min({m},ih))',format=yuv420p",
@@ -168,6 +175,8 @@ pub fn build_proxy_args(
             "128k",
             "-ar",
             "48000",
+            "-map_metadata",
+            "-1",
             "-movflags",
             "+faststart",
             "-y",
@@ -187,12 +196,16 @@ mod tests {
         let nv = build_proxy_args(Path::new("/in.mp4"), Path::new("/out.mp4"), true, true);
         let s = nv.join(" ");
         assert!(s.contains("-hwaccel cuda"));
+        assert!(s.contains("-protocol_whitelist file -i /in.mp4"));
+        assert!(s.contains("-map_metadata -1"));
         assert!(s.contains("h264_nvenc"));
         assert!(s.contains("-g 15 -bf 0"));
 
         let sw = build_proxy_args(Path::new("/in.mp4"), Path::new("/out.mp4"), false, false);
         let s2 = sw.join(" ");
         assert!(!s2.contains("cuda"));
+        assert!(s2.contains("-protocol_whitelist file -i /in.mp4"));
+        assert!(s2.contains("-map_metadata -1"));
         assert!(s2.contains("libx264"));
         assert!(s2.contains("-g 15 -bf 0"));
     }
