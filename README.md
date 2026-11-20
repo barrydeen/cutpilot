@@ -66,10 +66,14 @@ Then ask your agent to make an edit. Full workflow guide with the tool catalog:
 cargo run -p openprem-ui --release
 ```
 
-Type a new project directory in the top bar and press **New**, drop video files
-onto the window to import them, scrub the preview, drag clips, split/trim in
-the inspector, and hit **Export MP4**. Every click goes through the same
-engine commands the agent uses.
+Press **Import media…** in the top bar to bring up your desktop's file chooser
+(XDG portal). Picking media with **no project open creates one automatically**
+beside your files — canvas matched to the footage (rotation-aware), so portrait
+phone video gets a portrait timeline. You can also drop files onto the window,
+type a project directory and press **New**, or paste a media path in the Media
+panel. Scrub the preview, drag clips, split/trim in the inspector, and hit
+**Export MP4**. Every click goes through the same engine commands the agent
+uses.
 
 ## Feature status (v0.1 MVP)
 

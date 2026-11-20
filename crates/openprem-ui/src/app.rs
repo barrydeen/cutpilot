@@ -1,5 +1,6 @@
 //! The OpenPrem native editor app.
 
+use crate::filepicker::{self, PickerOutcome};
 use crate::timeline;
 use eframe::egui;
 use openprem_core::{
@@ -40,6 +41,22 @@ enum PreviewMsg {
     Frame(u64, RgbaFrame),
 }
 
+/// Shared status line: async threads report into it with a sequence number,
+/// and the UI adopts newer text every frame. Fixes the old behavior where
+/// background failures vanished into stderr.
+#[derive(Default)]
+struct StatusLine {
+    seq: u64,
+    text: String,
+}
+
+fn report_to(cell: &Arc<Mutex<StatusLine>>, text: impl Into<String>) {
+    if let Ok(mut line) = cell.lock() {
+        line.seq = line.seq.wrapping_add(1);
+        line.text = text.into();
+    }
+}
+
 pub struct OpenPremApp {
     engine: Arc<Mutex<Engine>>,
     /// Requests to the decode worker.
@@ -53,11 +70,20 @@ pub struct OpenPremApp {
     /// key -> uploaded texture.
     textures: HashMap<u64, egui::TextureHandle>,
     drag: timeline::DragState,
+    /// Displayed status (adopted from `status_cell` each frame).
     status: String,
+    status_cell: Arc<Mutex<StatusLine>>,
+    status_seq: u64,
     path_field: String,
+    /// Manual media path fallback field in the Media panel.
+    media_path_field: String,
+    /// Active file-picker worker, if any.
+    picker_rx: Option<std::sync::mpsc::Receiver<PickerOutcome>>,
+    /// Number of entries seen in the last frame's dropped-file list, so
+    /// re-processing only happens when the list actually grows.
+    drop_list_len: usize,
     export_bitrate: f64,
     use_nvenc: bool,
-    last_import_check: Instant,
 }
 
 impl OpenPremApp {
@@ -75,6 +101,9 @@ impl OpenPremApp {
                 }
             }
         });
+        let initial_status = "Press “Import media…” or drop a video — with no \
+                             project open, OpenPrem creates one beside your media."
+            .to_string();
         Self {
             engine: Arc::new(Mutex::new(Engine::new())),
             preview_tx: tx,
@@ -84,11 +113,18 @@ impl OpenPremApp {
             cache_order: VecDeque::new(),
             textures: HashMap::new(),
             drag: timeline::DragState::default(),
-            status: "Create or open a project to start editing.".into(),
+            status: initial_status.clone(),
+            status_cell: Arc::new(Mutex::new(StatusLine {
+                seq: 1,
+                text: initial_status,
+            })),
+            status_seq: 1,
             path_field: String::new(),
+            media_path_field: String::new(),
+            picker_rx: None,
+            drop_list_len: 0,
             export_bitrate: 0.0, // 0 = auto
             use_nvenc: true,
-            last_import_check: Instant::now(),
         }
     }
 
@@ -96,27 +132,95 @@ impl OpenPremApp {
     // engine plumbing
     // ------------------------------------------------------------------
 
+    /// Report a status line for the user (visible immediately).
+    fn report(&self, text: impl Into<String>) {
+        report_to(&self.status_cell, text);
+    }
+
     fn exec(&mut self, cmd: Command) {
         let mut engine = self.engine.lock().expect("engine lock");
         match engine.execute(cmd) {
             Ok(outcome) => {
-                self.status = outcome.message;
+                self.report(outcome.message);
             }
             Err(e) => {
-                self.status = format!("error: {e}");
+                self.report(format!("error: {e}"));
             }
         }
     }
 
-    fn exec_async(&self, cmd: Command) {
+    /// Import media files off-thread. When no project is open, one is
+    /// created automatically beside the first file (canvas matched to the
+    /// footage, rotation-aware) so a fresh drop can never be a no-op.
+    fn import_files(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
         let engine = self.engine.clone();
+        let status = self.status_cell.clone();
         std::thread::spawn(move || {
-            if let Ok(mut guard) = engine.lock() {
-                if let Err(e) = guard.execute(cmd) {
-                    eprintln!("openprem-ui: async command failed: {e}");
+            let needs_project = engine
+                .lock()
+                .map(|g| !g.is_open())
+                .unwrap_or(false);
+            if needs_project {
+                if let Err(msg) = auto_create_project_for(&engine, &status, &paths) {
+                    report_to(&status, msg);
+                    return;
+                }
+            }
+            let Ok(mut guard) = engine.lock() else { return };
+            for path in paths {
+                if !path.is_file() {
+                    report_to(
+                        &status,
+                        format!("skipped (not a file): {}", path.display()),
+                    );
+                    continue;
+                }
+                let already = guard
+                    .project()
+                    .map(|p| p.assets.iter().any(|a| a.path == path))
+                    .unwrap_or(false);
+                if already {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    report_to(&status, format!("already in the bin: {name}"));
+                    continue;
+                }
+                match guard.execute(Command::ImportMedia {
+                    path: path.clone(),
+                    auto_place: Some(true),
+                }) {
+                    Ok(_) => report_to(
+                        &status,
+                        format!("imported and placed: {}", path.display()),
+                    ),
+                    Err(e) => report_to(
+                        &status,
+                        format!("import failed ({}): {e}", path.display()),
+                    ),
                 }
             }
         });
+    }
+
+    /// Open the system file picker on a worker thread; the result comes back
+    /// through `picker_rx` and is polled in `ui`.
+    fn open_file_picker(&mut self) {
+        if self.picker_rx.is_some() {
+            return; // a picker is already open
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome =
+                filepicker::pick_files_blocking("Import media into OpenPrem");
+            let _ = tx.send(outcome);
+        });
+        self.picker_rx = Some(rx);
+        self.report("opening the file picker…");
     }
 
     fn project_snapshot(&self) -> Option<openprem_core::Project> {
@@ -234,8 +338,12 @@ impl OpenPremApp {
         ui.horizontal(|ui| {
             ui.label("OpenPrem");
             ui.separator();
+            if ui.button("Import media…").clicked() {
+                self.open_file_picker();
+            }
+            ui.separator();
             let path_field = &mut self.path_field;
-            ui.add(egui::TextEdit::singleline(path_field).hint_text("project directory").desired_width(280.0));
+            ui.add(egui::TextEdit::singleline(path_field).hint_text("project directory").desired_width(240.0));
             if ui.button("New").clicked() {
                 let dir = PathBuf::from(self.path_field.trim());
                 let name = dir
@@ -243,7 +351,7 @@ impl OpenPremApp {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "My Project".into());
                 if dir.as_os_str().is_empty() {
-                    self.status = "enter a project directory first".into();
+                    self.report("enter a project directory first");
                 } else {
                     self.exec(Command::CreateProject {
                         name,
@@ -258,7 +366,7 @@ impl OpenPremApp {
             if ui.button("Open").clicked() {
                 let dir = PathBuf::from(self.path_field.trim());
                 if dir.as_os_str().is_empty() {
-                    self.status = "enter a project directory first".into();
+                    self.report("enter a project directory first");
                 } else {
                     self.exec(Command::OpenProject { path: dir });
                 }
@@ -280,45 +388,91 @@ impl OpenPremApp {
                     .color(ui.visuals().text_color()),
             );
         });
-        // Drag-and-drop media import.
-        let dropped: Vec<PathBuf> = ui.input(|i| {
-            i.raw
-                .dropped_files
+
+        // Keep the path field in sync with an auto-created project so Save
+        // and the field agree on where the project lives.
+        if self.path_field.trim().is_empty() {
+            let dir = self
+                .engine
+                .lock()
+                .expect("engine lock")
+                .project_dir()
+                .map(std::path::Path::to_path_buf);
+            if let Some(dir) = dir {
+                self.path_field = dir.display().to_string();
+            }
+        }
+
+        // Drag-and-drop import (kept alongside the browse button). egui's
+        // dropped-file list persists after a drop, so only entries the list
+        // actually gained since the last frame are processed — no import
+        // spam, and a re-drop of the same file still works.
+        let prev_len = self.drop_list_len;
+        let (raw_len, new_paths): (usize, Vec<PathBuf>) = ui.input(|i| {
+            let len = i.raw.dropped_files.len();
+            let start = prev_len.min(len);
+            let tail: Vec<PathBuf> = i.raw.dropped_files[start..]
                 .iter()
                 .filter_map(|d| {
                     let p = d.path();
-                    if p.as_os_str().is_empty() {
-                        None
-                    } else {
-                        Some(p.to_path_buf())
-                    }
+                    (!p.as_os_str().is_empty()).then(|| p.to_path_buf())
                 })
-                .collect()
+                .collect();
+            (len, tail)
         });
-        if !dropped.is_empty() && Instant::now().duration_since(self.last_import_check).as_millis() > 400
-        {
-            self.last_import_check = Instant::now();
-            for path in dropped {
-                let cmd = Command::ImportMedia {
-                    path,
-                    auto_place: Some(true),
-                };
-                self.exec_async(cmd);
-                self.status = "importing…".into();
-            }
+        self.drop_list_len = raw_len;
+        if raw_len > prev_len && !new_paths.is_empty() {
+            let n = new_paths.len();
+            self.report(format!("importing {n} dropped file(s)…"));
+            self.import_files(new_paths);
         }
     }
 
     fn media_bin(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Media");
+        ui.horizontal(|ui| {
+            if ui.button("Browse files…").clicked() {
+                self.open_file_picker();
+            }
+            let field = &mut self.media_path_field;
+            ui.add(
+                egui::TextEdit::singleline(field)
+                    .hint_text("or paste a file path")
+                    .desired_width(120.0),
+            );
+            if ui.button("Import").clicked() {
+                let text = self.media_path_field.trim().to_string();
+                if text.is_empty() {
+                    self.report("enter a media file path first");
+                } else {
+                    let path = PathBuf::from(text);
+                    if !path.is_file() {
+                        self.report(format!("not a file: {}", path.display()));
+                    } else {
+                        self.media_path_field.clear();
+                        self.report(format!("importing {}", path.display()));
+                        self.import_files(vec![path]);
+                    }
+                }
+            }
+        });
         let Some(project) = self.project_snapshot() else {
-            ui.label("No project open.");
+            ui.label(
+                egui::RichText::new(
+                    "No project open — Browse or drop a video and one is \
+                     created automatically beside your media.",
+                )
+                .small(),
+            );
             return;
         };
-        ui.heading("Media");
         if project.assets.is_empty() {
             ui.label(
-                egui::RichText::new("Drop video files here or edit on the timeline via MCP.")
-                    .small(),
+                egui::RichText::new(
+                    "Press Browse files… or drop video onto the window; agents \
+                     can import via MCP `media_import`.",
+                )
+                .small(),
             );
         }
         for asset in &project.assets {
@@ -412,7 +566,8 @@ impl OpenPremApp {
     fn cut_silence_for_asset(&mut self, asset_id: uuid::Uuid) {
         // Run detection on a worker; apply the cut on the engine after.
         let engine = self.engine.clone();
-        self.status = "detecting silence…".into();
+        let status = self.status_cell.clone();
+        self.report("detecting silence…");
         std::thread::spawn(move || {
             let Ok(mut guard) = engine.lock() else { return };
             let detect = Command::DetectSilence {
@@ -452,12 +607,18 @@ impl OpenPremApp {
             }
             // Descending order keeps earlier ranges valid.
             commands.reverse();
-            if !commands.is_empty() {
-                let _ = guard.execute(Command::CommandsBatch {
-                    commands,
-                    expected_revision: None,
-                    label: Some("cut detected silence".into()),
-                });
+            if commands.is_empty() {
+                report_to(&status, "no silence worth cutting was found");
+                return;
+            }
+            let count = commands.len();
+            match guard.execute(Command::CommandsBatch {
+                commands,
+                expected_revision: None,
+                label: Some("cut detected silence".into()),
+            }) {
+                Ok(_) => report_to(&status, format!("cut {count} silence range(s)")),
+                Err(e) => report_to(&status, format!("silence cut failed: {e}")),
             }
         });
     }
@@ -782,6 +943,87 @@ fn latest_key_for(cache: &HashMap<u64, (RgbaFrame, Instant)>) -> Option<u64> {
         .map(|(k, _)| *k)
 }
 
+/// Create a project sized to the first media file (rotation-aware), placed
+/// beside that file. Called on import threads when no project is open, so
+/// dropping/picking media into an empty editor is never a dead end.
+fn auto_create_project_for(
+    engine: &Arc<Mutex<Engine>>,
+    status: &Arc<Mutex<StatusLine>>,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    let first = paths
+        .iter()
+        .find(|p| p.is_file())
+        .ok_or("none of the files exist")?;
+    let probe = openprem_media::ffprobe::probe(first).ok();
+    let (w, h) = probe
+        .as_ref()
+        .map(|p| p.probe.oriented_size())
+        .unwrap_or((1920, 1080));
+    let even = |v: u32| v.clamp(2, 7680) & !1;
+    let (w, h) = (even(w), even(h));
+    let fps = probe
+        .as_ref()
+        .and_then(|p| p.probe.fps)
+        .filter(|f| (1.0..=240.0).contains(&f.as_f64()));
+    let (fps_num, fps_den) = fps.map(|f| (f.num, f.den)).unwrap_or((30, 1));
+    let parent = first
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+    let stem = first
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "OpenPrem Project".into());
+    let dir = unique_project_dir(&parent, &stem);
+    let mut guard = engine.lock().map_err(|e| format!("engine lock: {e}"))?;
+    guard
+        .execute(Command::CreateProject {
+            name: stem.clone(),
+            path: dir.clone(),
+            width: Some(w),
+            height: Some(h),
+            fps_num: Some(fps_num),
+            fps_den: Some(fps_den),
+        })
+        .map_err(|e| format!("could not create project: {e}"))?;
+    let fps_display = openprem_core::Fps::new(fps_num, fps_den).display();
+    report_to(
+        status,
+        format!(
+            "created project {} ({}×{} @ {}fps)",
+            dir.display(),
+            w,
+            h,
+            fps_display
+        ),
+    );
+    Ok(())
+}
+
+/// `<stem>.openprem`, then `<stem>-2.openprem`, ... — never overwrites.
+fn unique_project_dir(parent: &std::path::Path, stem: &str) -> PathBuf {
+    let base = parent.join(format!("{stem}.openprem"));
+    if !base.exists() {
+        return base;
+    }
+    for i in 2..100 {
+        let candidate = parent.join(format!("{stem}-{i}.openprem"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    parent.join(format!("{stem}-{stamp}.openprem"))
+}
+
 fn decode_layers(req: &PreviewRequest) -> RgbaFrame {
     let mut bytes = Vec::with_capacity((req.canvas_w * req.canvas_h * 4) as usize);
     for _ in 0..(req.canvas_w * req.canvas_h) {
@@ -811,6 +1053,37 @@ fn decode_layers(req: &PreviewRequest) -> RgbaFrame {
 
 impl eframe::App for OpenPremApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Adopt newer status text reported by background threads.
+        {
+            let cell = self.status_cell.lock().expect("status lock");
+            if cell.seq != self.status_seq {
+                self.status_seq = cell.seq;
+                self.status = cell.text.clone();
+            }
+        }
+
+        // Poll the file picker worker.
+        let picked: Option<PickerOutcome> =
+            self.picker_rx.as_ref().and_then(|rx| match rx.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(PickerOutcome::Cancelled)
+                }
+            });
+        if let Some(outcome) = picked {
+            self.picker_rx = None;
+            match outcome {
+                PickerOutcome::Files(paths) => {
+                    let n = paths.len();
+                    self.report(format!("importing {n} file(s)…"));
+                    self.import_files(paths);
+                }
+                PickerOutcome::Cancelled => {}
+                PickerOutcome::Failed(msg) => self.report(msg),
+            }
+        }
+
         // Drain completed preview frames.
         self.drain_preview_results(ui.ctx());
 
@@ -886,7 +1159,23 @@ impl eframe::App for OpenPremApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(project) = self.project_snapshot() else {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("OpenPrem");
+                    ui.vertical_centered(|ui| {
+                        ui.heading("OpenPrem");
+                        ui.label(
+                            egui::RichText::new(
+                                "Press “Import media…” or drop a video file anywhere.",
+                            )
+                            .color(ui.visuals().text_color()),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "With no project open, one is created beside your media — \
+                                 sized to match your footage.",
+                            )
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    });
                 });
                 return;
             };

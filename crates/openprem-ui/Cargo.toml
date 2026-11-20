@@ -15,3 +15,5 @@ openprem-engine.workspace = true
 eframe = "0.37"
 uuid.workspace = true
 serde_json.workspace = true
+rfd = "0.18"
+pollster = "1"

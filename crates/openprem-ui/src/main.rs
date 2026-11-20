@@ -3,6 +3,7 @@
 //! engine command surface the MCP server exposes.
 
 mod app;
+mod filepicker;
 mod timeline;
 
 use eframe::egui;

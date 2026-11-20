@@ -34,7 +34,7 @@ and adjust the same project in the native UI.
   EXPECT: docs verification passed
   EVIDENCE: automatic-evidence=v1; definition-sha256=c42a7b79e63f3907ba8ece34f61df88183fb3a7892bc1ae6926030f89b5d8ead; exit=0; EXPECT=matched; output-sha256=a0b8a56b9e9cb377e1fea7fae83d4d29732b8b0c504e680f2cb1a3871fed8f8a; output-bytes=25; shell=/bin/sh; cwd=/home/barry/Projects/OpenPrem; path=74375e68222c/20 entries
 
-- [ ] G6: Manual UI smoke test — launch `cargo run -p openprem-ui --release`, import a real video, scrub the preview, trim/split a clip, and start an export from the UI
+- [ ] G6: Manual UI smoke test — launch `openprem-ui`, press `Import media…` and pick a real video through the portal file chooser (no project open, so one is auto-created beside the media), scrub the preview, trim/split a clip, and start an export from the UI
   EVIDENCE: pending
 
 - [ ] G7: Manual HyperFrames render — run the documented `hyperframes_create` workflow against a real MCP session so `npx hyperframes` renders a transparent ProRes overlay and it composites into the timeline and export
