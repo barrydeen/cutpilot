@@ -118,6 +118,43 @@ pub enum Command {
         replace: Option<bool>,
     },
 
+    // ---- audio recording / voiceover ----
+    /// List available audio input devices (microphones) and recording backends.
+    ListAudioInputs {},
+    /// Begin live audio recording into `<project>/recordings/<name>.wav`.
+    /// Call `stop_audio_recording` to finish, probe, and place the voiceover
+    /// clip onto the timeline.
+    StartAudioRecording {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        device: Option<String>,
+        #[serde(default)]
+        track_id: Option<Uuid>,
+        #[serde(default)]
+        insert_at_ticks: Option<Ticks>,
+        #[serde(default)]
+        sample_rate: Option<u32>,
+        #[serde(default)]
+        channels: Option<u16>,
+        #[serde(default)]
+        auto_place: Option<bool>,
+        #[serde(default)]
+        input_gain: Option<f32>,
+        #[serde(default)]
+        studio_voice: Option<bool>,
+    },
+    /// Poll active recording status, elapsed ticks, and live peak/RMS meter levels.
+    GetRecordingStatus {},
+    /// Stop the active audio recording. When `discard` is false (default),
+    /// finalizes the WAV, probes it, imports it to the Media Bin, and inserts
+    /// it on the timeline in one undoable step. When `discard` is true, deletes
+    /// the take without modifying the project.
+    StopAudioRecording {
+        #[serde(default)]
+        discard: Option<bool>,
+    },
+
     // ---- tracks ----
     AddTrack {
         track_kind: String,
@@ -344,6 +381,10 @@ impl Command {
             TranscribeMedia { .. } => "transcribe_media",
             GetTranscript { .. } => "get_transcript",
             TranscriptToCaptions { .. } => "transcript_to_captions",
+            ListAudioInputs { .. } => "list_audio_inputs",
+            StartAudioRecording { .. } => "start_audio_recording",
+            GetRecordingStatus { .. } => "get_recording_status",
+            StopAudioRecording { .. } => "stop_audio_recording",
             AddTrack { .. } => "add_track",
             UpdateTrack { .. } => "update_track",
             MoveTrack { .. } => "move_track",
@@ -456,6 +497,10 @@ pub const KINDS: &[&str] = &[
     "transcribe_media",
     "get_transcript",
     "transcript_to_captions",
+    "list_audio_inputs",
+    "start_audio_recording",
+    "get_recording_status",
+    "stop_audio_recording",
     "add_track",
     "update_track",
     "move_track",
@@ -643,6 +688,22 @@ mod tests {
             TranscriptToCaptions {
                 asset_id: None,
                 replace: Some(false),
+            },
+            ListAudioInputs {},
+            StartAudioRecording {
+                name: Some("voiceover-001".into()),
+                device: None,
+                track_id: None,
+                insert_at_ticks: Some(0),
+                sample_rate: Some(48_000),
+                channels: Some(1),
+                auto_place: Some(true),
+                input_gain: Some(0.65),
+                studio_voice: Some(true),
+            },
+            GetRecordingStatus {},
+            StopAudioRecording {
+                discard: Some(false),
             },
             AddTrack {
                 track_kind: "video".into(),

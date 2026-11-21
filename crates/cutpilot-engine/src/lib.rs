@@ -14,7 +14,7 @@ pub mod jobs;
 pub mod preview;
 pub mod project_io;
 
-pub use engine::Engine;
+pub use engine::{Engine, LiveRecordingSnapshot, RecordingMonitor};
 pub use error::EngineError;
 pub use ipc::{IpcLogEntry, IpcServer, IpcStats};
 pub use jobs::{ActiveJobSnapshot, JobInfo, JobRegistry, JobState};

@@ -365,10 +365,11 @@ pub fn build_export_plan(
             "the timeline has no clips; insert media before exporting".into(),
         );
     }
+    let gap_map = GapMap::new_for_fps(&base_clips, *fps);
     let expected_duration_ticks: Ticks = if base_clips.is_empty() {
         audio_only_end
     } else {
-        base_clips.iter().map(|c| c.timeline_duration()).sum()
+        gap_map.total
     };
 
     let bitrate = opts
@@ -422,23 +423,27 @@ pub fn build_export_plan(
         && !has_captions
         && all_base_cuda_eligible;
 
-    // Collect link groups that already have a clip on an Audio track so we do
-    // not double-mix the embedded audio from the base video clip (+6 dB bug).
+    // Collect all clips on Audio tracks so we never double-mix a base video
+    // clip's embedded audio when an Audio-track clip already covers it (either
+    // via a shared `link_group`, or when the user unlinked a video/audio pair
+    // to move or boost its audio on another track like A4).
     let audio_track_ids: HashSet<Uuid> = project
         .tracks
         .iter()
         .filter(|t| t.kind == TrackKind::Audio)
         .map(|t| t.id)
         .collect();
-    let linked_audio_groups: HashSet<Uuid> = project
+    let audio_track_clips: Vec<&Clip> = project
         .clips
         .iter()
         .filter(|c| audio_track_ids.contains(&c.track_id))
+        .collect();
+    let linked_audio_groups: HashSet<Uuid> = audio_track_clips
+        .iter()
         .filter_map(|c| c.link_group)
         .collect();
 
     let mut b = Builder::new();
-    let gap_map = GapMap::new(&base_clips);
 
     // --- base video segments ---
     let mut base_labels: Vec<String> = Vec::new();
@@ -475,13 +480,17 @@ pub fn build_export_plan(
     let sx = settings_w as f64 / project.settings.width.max(1) as f64;
     let sy = settings_h as f64 / project.settings.height.max(1) as f64;
 
-    for clip in &base_clips {
+    for (seg_idx, clip) in base_clips.iter().enumerate() {
         let asset = project
             .asset(&clip.asset_id)
             .ok_or_else(|| format!("clip {} references a missing asset", clip.asset_id))?;
-        let src_dur = cutpilot_core::secs_from_ticks(clip.source_duration());
-        let tl_dur = cutpilot_core::secs_from_ticks(clip.timeline_duration());
+        let clip_frames = gap_map.segment_frames(seg_idx);
+        let export_ticks = gap_map.segment_export_ticks(seg_idx);
+        let export_secs = cutpilot_core::secs_from_ticks(export_ticks);
         let speed = clip.effective_speed();
+        // Give the input demuxer a small cushion (+0.08s) so exact frame/sample
+        // trimming in the filtergraph never comes up 1 frame short on VFR/HEVC.
+        let src_read_dur = (export_secs * speed as f64) + 0.08;
         let clip_nvdec = hwaccel
             && asset.kind == AssetKind::Video
             && asset
@@ -492,11 +501,11 @@ pub fn build_export_plan(
         let input = match asset.kind {
             AssetKind::Image => InputSpec::Still {
                 path: asset.path.clone(),
-                dur: tl_dur,
+                dur: export_secs,
             },
             _ => InputSpec::Media {
                 path: asset.path.clone(),
-                seek: Some((cutpilot_core::secs_from_ticks(clip.source_in), src_dur)),
+                seek: Some((cutpilot_core::secs_from_ticks(clip.source_in), src_read_dur)),
                 hw_cuda: clip_nvdec,
                 cuda_surfaces: gpu_resident,
             },
@@ -512,10 +521,11 @@ pub fn build_export_plan(
                 .unwrap_or(false);
 
         if gpu_resident {
-            // Pure GPU-resident VRAM pipeline: zero CPU copies!
+            // Pure GPU-resident VRAM pipeline: zero CPU copies, exact frame count!
             let chain = if exact_canvas_match {
                 format!(
-                    "[{idx}:v]scale_cuda={w}:{h}:format=nv12:passthrough=1[{label}]",
+                    "[{idx}:v]scale_cuda={w}:{h}:format=nv12:passthrough=1,\
+                     trim=end_frame={clip_frames},setpts=PTS-STARTPTS[{label}]",
                     w = settings_w,
                     h = settings_h,
                 )
@@ -523,7 +533,8 @@ pub fn build_export_plan(
                 format!(
                     "[{idx}:v]scale_cuda={w}:{h}:force_original_aspect_ratio=decrease:\
                      force_divisible_by=2:format=nv12,\
-                     pad_cuda={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black[{label}]",
+                     pad_cuda={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,\
+                     trim=end_frame={clip_frames},setpts=PTS-STARTPTS[{label}]",
                     w = settings_w,
                     h = settings_h,
                 )
@@ -555,22 +566,28 @@ pub fn build_export_plan(
             chain.push(',');
             chain.push_str(&fps_arg);
             if let Some(motion) = &clip.motion {
-                append_motion_zoompan(&mut chain, motion, settings_w, settings_h, *fps, tl_dur);
+                append_motion_zoompan(&mut chain, motion, settings_w, settings_h, *fps, export_secs);
             }
             append_color_grade(&mut chain, clip);
-            chain.push_str(&fade_filters_for_clip(project, clip, tl_dur));
-            chain.push_str(&format!("[{label}]"));
+            chain.push_str(&fade_filters_for_clip(project, clip, export_secs));
+            // Enforce exact frame count per segment so multi-clip V1 concat
+            // never accumulates +10..30 ms/clip lip-sync drift against audio tracks.
+            chain.push_str(&format!(
+                ",tpad=stop_mode=clone:stop_duration=0.1,trim=end_frame={clip_frames},setpts=PTS-STARTPTS[{label}]"
+            ));
             b.filter(chain);
         }
         base_labels.push(label);
 
         // Segment audio: only pull embedded audio from the base video clip if
-        // no linked Audio-track clip represents it (avoids +6dB doubled audio).
-        let has_linked_audio = clip
-            .link_group
-            .map(|g| linked_audio_groups.contains(&g))
-            .unwrap_or(false);
-        let has_audio = !has_linked_audio
+        // no Audio-track clip represents it (neither via shared `link_group`
+        // nor as an unlinked clip of the same asset overlapping this window).
+        let covered_by_audio_track = base_clip_covered_by_audio_track(
+            clip,
+            &linked_audio_groups,
+            &audio_track_clips,
+        );
+        let has_audio = !covered_by_audio_track
             && asset.probe.as_ref().map(|p| p.has_audio).unwrap_or(false);
         let audio_label = b.label("a");
         if has_audio {
@@ -581,17 +598,21 @@ pub fn build_export_plan(
                 achain.push_str(&atempo);
             }
             achain.push_str(&format!(
-                ",aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo[{al}]",
+                ",aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,\
+                 apad,atrim=0:{dur},asetpts=PTS-STARTPTS[{al}]",
+                dur = fmt_secs(export_secs),
                 al = audio_label
             ));
             b.filter(achain);
         } else {
             let sil = b.add_input(InputSpec::Silence {
-                dur: tl_dur,
+                dur: export_secs,
                 sample_rate: sr,
             });
             b.filter(format!(
-                "[{sil}:a]aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo[{al}]",
+                "[{sil}:a]aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo,\
+                 apad,atrim=0:{dur},asetpts=PTS-STARTPTS[{al}]",
+                dur = fmt_secs(export_secs),
                 al = audio_label
             ));
         }
@@ -1089,36 +1110,89 @@ fn escape_filter_path(path: &str) -> String {
         .replace('\'', "\\'")
 }
 
-/// Maps timeline ticks to export seconds when base-track gaps collapse.
+/// True when a base video clip's audio is already represented by a clip on an
+/// Audio track — either via a shared `link_group` OR as an unlinked clip of
+/// the same asset overlapping the video clip's timeline range.
+fn base_clip_covered_by_audio_track(
+    base_clip: &Clip,
+    linked_audio_groups: &HashSet<Uuid>,
+    audio_track_clips: &[&Clip],
+) -> bool {
+    if base_clip
+        .link_group
+        .map(|g| linked_audio_groups.contains(&g))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let v_start = base_clip.timeline_start;
+    let v_end = base_clip.timeline_end();
+    audio_track_clips.iter().any(|ac| {
+        ac.asset_id == base_clip.asset_id && ac.timeline_start < v_end && v_start < ac.timeline_end()
+    })
+}
+
+/// Maps timeline ticks to exact frame-quantized export ticks when base-track
+/// gaps collapse. Every base segment's exported duration is an exact integer
+/// multiple of `fps.frame_duration_ticks()`, using cumulative error diffusion
+/// so multi-clip exports never accumulate lip-sync drift.
 struct GapMap {
-    segments: Vec<(Ticks, Ticks, Ticks)>,
+    /// `(timeline_start, timeline_end, export_start, export_dur, frames)`
+    segments: Vec<(Ticks, Ticks, Ticks, Ticks, u64)>,
     total: Ticks,
 }
 
 impl GapMap {
+    #[cfg(test)]
     fn new(base_clips: &[&Clip]) -> Self {
-        let mut segments = Vec::new();
-        let mut cursor: Ticks = 0;
+        Self::new_for_fps(base_clips, Fps::from_int(30))
+    }
+
+    fn new_for_fps(base_clips: &[&Clip], fps: Fps) -> Self {
+        let frame_ticks = fps.frame_duration_ticks().max(1);
+        let mut segments = Vec::with_capacity(base_clips.len());
+        let mut ideal_cursor: Ticks = 0;
+        let mut quantized_frames: u64 = 0;
         for clip in base_clips {
-            segments.push((clip.timeline_start, clip.timeline_end(), cursor));
-            cursor += clip.timeline_duration();
+            let export_start = quantized_frames as Ticks * frame_ticks;
+            ideal_cursor += clip.timeline_duration();
+            let target_frames = ((ideal_cursor as f64 / frame_ticks as f64).round() as u64)
+                .max(quantized_frames + 1);
+            let seg_frames = (target_frames - quantized_frames).max(1);
+            let export_dur = seg_frames as Ticks * frame_ticks;
+            segments.push((
+                clip.timeline_start,
+                clip.timeline_end(),
+                export_start,
+                export_dur,
+                seg_frames,
+            ));
+            quantized_frames += seg_frames;
         }
         Self {
             segments,
-            total: cursor,
+            total: quantized_frames as Ticks * frame_ticks,
         }
+    }
+
+    fn segment_frames(&self, idx: usize) -> u64 {
+        self.segments.get(idx).map(|s| s.4).unwrap_or(1)
+    }
+
+    fn segment_export_ticks(&self, idx: usize) -> Ticks {
+        self.segments.get(idx).map(|s| s.3).unwrap_or(0)
     }
 
     fn map(&self, t: Ticks) -> Ticks {
         if self.segments.is_empty() {
             return t;
         }
-        for (start, end, export_start) in &self.segments {
-            if t < *start {
-                return *export_start;
+        for &(start, end, export_start, export_dur, _) in &self.segments {
+            if t < start {
+                return export_start;
             }
-            if t < *end {
-                return export_start + (t - start);
+            if t < end {
+                return export_start + (t - start).min(export_dur);
             }
         }
         self.total
@@ -1127,7 +1201,7 @@ impl GapMap {
 
 /// Remap captions into export time for the ASS burn-in.
 pub fn remapped_captions(project: &Project, base_clips: &[&Clip]) -> Vec<Caption> {
-    let map = GapMap::new(base_clips);
+    let map = GapMap::new_for_fps(base_clips, project.settings.fps);
     project
         .captions
         .iter()
@@ -1469,6 +1543,87 @@ mod tests {
         assert!(joined.contains("anullsrc=r=48000:cl=stereo"));
         assert!(joined.contains("volume=0.7000"));
         assert!(!joined.contains("[0:a]"));
+    }
+
+    #[test]
+    fn unlinked_video_with_same_asset_on_audio_track_is_not_double_mixed() {
+        let mut p = Project::new("t", ProjectSettings::default());
+        let a1 = asset("talking_head", 30.0, true);
+        let id1 = a1.id;
+        p.assets.push(a1);
+        // Video on V1 with link_group: None; unlinked audio moved to an Audio track with volume=2.0.
+        let v = base_clip(&p, id1, 10, 15);
+        let mut a = base_clip(&p, id1, 10, 15);
+        a.track_id = p.tracks[1].id;
+        a.link_group = None;
+        a.volume = 2.0;
+        p.clips.extend([v, a]);
+
+        let opts = ExportOptions {
+            use_nvenc: Some(false),
+            hwaccel: Some(false),
+            ..Default::default()
+        };
+        let plan = build_export_plan(&p, Path::new("/tmp/out.mp4"), None, &opts).unwrap();
+        let joined = plan.args.join(" ");
+        // V1 embedded audio [0:a] MUST NOT be pulled when an audio clip of the
+        // same asset overlaps on an Audio track (avoids double-mixed echo!).
+        assert!(!joined.contains("[0:a]"), "unlinked audio double-mixed: {joined}");
+        assert!(joined.contains("volume=2.0000"));
+    }
+
+    #[test]
+    fn fractional_clip_durations_stay_frame_quantized_and_synced_across_many_cuts() {
+        let mut p = Project::new("sync", ProjectSettings::default()); // 30 fps
+        let a = asset("broll", 30.0, true);
+        let id = a.id;
+        p.assets.push(a);
+
+        // 21 clips with fractional non-frame-aligned durations (e.g. 2.143s each),
+        // followed by a talking-head clip whose audio is on A1.
+        let mut cursor: Ticks = 0;
+        let frac_dur = cutpilot_core::ticks_from_secs(2.143);
+        for _ in 0..21 {
+            let mut v = base_clip(&p, id, 0, 1);
+            v.timeline_start = cursor;
+            v.source_in = 0;
+            v.source_out = frac_dur;
+            p.clips.push(v);
+            cursor += frac_dur;
+        }
+        let talking_start = cursor;
+        let talking_dur = cutpilot_core::ticks_from_secs(10.0);
+        let mut tv = base_clip(&p, id, 0, 10);
+        tv.timeline_start = talking_start;
+        tv.source_in = 0;
+        tv.source_out = talking_dur;
+        let mut ta = tv.clone();
+        ta.id = Uuid::new_v4();
+        ta.track_id = p.tracks[1].id;
+        p.clips.extend([tv, ta]);
+
+        let opts = ExportOptions {
+            use_nvenc: Some(false),
+            hwaccel: Some(false),
+            ..Default::default()
+        };
+        let plan = build_export_plan(&p, Path::new("/tmp/out.mp4"), None, &opts).unwrap();
+        let joined = plan.args.join(" ");
+
+        // Every base clip must enforce exact frame count (`trim=end_frame=`)
+        // and exact sample-aligned audio bed (`apad,atrim=0:`), and cumulative
+        // error diffusion keeps total drift <= half a frame (~17 ms)!
+        assert!(joined.contains("trim=end_frame="));
+        assert!(joined.contains("apad,atrim=0:"));
+        let base_clips = p.clips_on_track(&p.tracks[0].id);
+        let map = GapMap::new_for_fps(&base_clips, p.settings.fps);
+        let mapped_talking = map.map(talking_start);
+        let drift_ticks = (mapped_talking - talking_start).abs();
+        let half_frame = p.settings.fps.frame_duration_ticks() / 2;
+        assert!(
+            drift_ticks <= half_frame,
+            "cumulative sync drift {drift_ticks} ticks exceeded half a frame ({half_frame})"
+        );
     }
 
     #[test]

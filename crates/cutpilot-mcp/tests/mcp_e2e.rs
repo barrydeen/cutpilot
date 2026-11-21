@@ -203,7 +203,9 @@ fn mcp_session_full_youtube_workflow() {
         "system_capabilities", "project_create", "project_open", "project_save",
         "project_get", "timeline_get", "media_import", "media_list", "media_probe",
         "media_detect_silence", "media_thumbnail", "media_contact_sheet",
-        "media_waveform", "media_transcribe", "transcript_get",
+        "media_waveform", "media_transcribe", "audio_inputs_list",
+        "audio_record_start", "audio_record_status", "audio_record_stop",
+        "transcript_get",
         "transcript_to_captions", "track_add", "track_update", "clip_insert", "clip_move",
         "clip_trim", "clip_split", "clip_remove", "clip_update",
         "clip_zoom_pan", "clip_set_speed", "clip_color_grade",
@@ -320,6 +322,33 @@ fn mcp_session_full_youtube_workflow() {
     let wav_placed = wav_imported["data"]["placed_clips"].as_array().unwrap();
     assert_eq!(wav_placed.len(), 1);
     assert_eq!(wav_placed[0]["timeline_start"], 0);
+
+    // --- voiceover audio recorder (start -> status -> stop & insert -> undo) ---
+    let inputs = tool_json(&client.call_tool("audio_inputs_list", json!({})));
+    assert!(!inputs["data"]["devices"].as_array().unwrap().is_empty());
+    let rec_started = tool_json(&client.call_tool(
+        "audio_record_start",
+        json!({
+            "name": "e2e-voiceover",
+            "device": "synthetic:tone",
+            "insert_at_ticks": 1_800_000,
+            "sample_rate": 48000,
+            "channels": 1,
+            "auto_place": true,
+        }),
+    ));
+    assert_eq!(rec_started["data"]["name"], "e2e-voiceover");
+    std::thread::sleep(Duration::from_millis(220));
+    let rec_status = tool_json(&client.call_tool("audio_record_status", json!({})));
+    assert_eq!(rec_status["data"]["recording"], true);
+    assert!(rec_status["data"]["elapsed_ticks"].as_i64().unwrap() > 0);
+    let rec_stopped = tool_json(&client.call_tool("audio_record_stop", json!({})));
+    assert_eq!(rec_stopped["data"]["discarded"], false);
+    assert!(rec_stopped["data"]["duration_ticks"].as_i64().unwrap() > 0);
+    assert_eq!(rec_stopped["data"]["placed_clip"]["timeline_start"], 1_800_000);
+    assert!(PathBuf::from(rec_stopped["data"]["path"].as_str().unwrap()).is_file());
+    // Undo voiceover so the rest of the e2e duration checks stay identical.
+    client.call_tool("history_undo", json!({}));
 
     // --- timeline sanity ---
     let timeline = tool_json(&client.call_tool("timeline_get", json!({})));

@@ -962,10 +962,13 @@ fn build_audio_tracks(
         .filter(|t| t.kind == TrackKind::Audio)
         .map(|t| t.id)
         .collect();
-    let linked_audio_groups: std::collections::HashSet<Uuid> = project
+    let audio_track_clips: Vec<&cutpilot_core::Clip> = project
         .clips
         .iter()
         .filter(|c| audio_track_ids.contains(&c.track_id))
+        .collect();
+    let linked_audio_groups: std::collections::HashSet<Uuid> = audio_track_clips
+        .iter()
         .filter_map(|c| c.link_group)
         .collect();
 
@@ -978,7 +981,7 @@ fn build_audio_tracks(
             let Some(asset) = project.asset(&clip.asset_id) else {
                 continue;
             };
-            let vol = (clip.volume * track.volume * master_volume).clamp(0.0, 2.0);
+            let vol = (clip.volume * track.volume * master_volume).clamp(0.0, 4.0);
             if vol <= 0.001 {
                 continue;
             }
@@ -1014,14 +1017,19 @@ fn build_audio_tracks(
                     .link_group
                     .map(|g| linked_audio_groups.contains(&g))
                     .unwrap_or(false);
-                if has_linked {
+                let covered_unlinked = audio_track_clips.iter().any(|ac| {
+                    ac.asset_id == clip.asset_id
+                        && ac.timeline_start < clip.timeline_end()
+                        && clip.timeline_start < ac.timeline_end()
+                });
+                if has_linked || covered_unlinked {
                     continue;
                 }
                 let Some(asset) = project.asset(&clip.asset_id) else {
                     continue;
                 };
                 if asset.probe.as_ref().map(|p| p.has_audio).unwrap_or(false) {
-                    let vol = (clip.volume * base.volume * master_volume).clamp(0.0, 2.0);
+                    let vol = (clip.volume * base.volume * master_volume).clamp(0.0, 4.0);
                     if vol <= 0.001 {
                         continue;
                     }
@@ -1414,6 +1422,84 @@ mod tests {
         assert!((segment_fade_gain(TICKS_PER_SEC + TICKS_PER_SEC / 4, seg) - 0.5).abs() < 1e-4);
         assert!((segment_fade_gain(TICKS_PER_SEC * 3, seg) - 1.0).abs() < 1e-4);
         assert!((segment_fade_gain(TICKS_PER_SEC * 6 - TICKS_PER_SEC / 4, seg) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn unlinked_video_covered_by_audio_track_is_not_double_mixed_in_preview() {
+        let mut p = Project::new("unlinked", ProjectSettings::default());
+        let vid = Asset {
+            id: Uuid::new_v4(),
+            kind: AssetKind::Video,
+            name: "talking".into(),
+            path: PathBuf::from("/tmp/talking.mp4"),
+            probe: Some(MediaProbe {
+                duration_ticks: TICKS_PER_SEC * 10,
+                width: 1920,
+                height: 1080,
+                fps: None,
+                has_audio: true,
+                rotation_deg: 0,
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("aac".into()),
+                sample_rate: Some(48_000),
+            }),
+            generated: None,
+        };
+        let vid_id = vid.id;
+        p.assets.push(vid);
+
+        // Video on V1 and unlinked audio of same asset on A1 at overlapping range.
+        p.clips.push(Clip {
+            id: Uuid::new_v4(),
+            asset_id: vid_id,
+            track_id: p.tracks[0].id,
+            timeline_start: 0,
+            source_in: 0,
+            source_out: TICKS_PER_SEC * 10,
+            link_group: None,
+            opacity: 1.0,
+            scale: 1.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            volume: 1.0,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            speed: 1.0,
+            rotation_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+            crop: Default::default(),
+            motion: None,
+            color: Default::default(),
+        });
+        p.clips.push(Clip {
+            id: Uuid::new_v4(),
+            asset_id: vid_id,
+            track_id: p.tracks[1].id,
+            timeline_start: 0,
+            source_in: 0,
+            source_out: TICKS_PER_SEC * 10,
+            link_group: None,
+            opacity: 1.0,
+            scale: 1.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            volume: 1.5,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            speed: 1.0,
+            rotation_deg: 0.0,
+            flip_h: false,
+            flip_v: false,
+            crop: Default::default(),
+            motion: None,
+            color: Default::default(),
+        });
+
+        let tracks = build_audio_tracks(&p, &HashMap::new(), false, 1.0);
+        // Only the A1 audio clip should play — V1 must NOT double-mix it!
+        assert_eq!(tracks.len(), 1);
+        assert!((tracks[0][0].volume - 1.5).abs() < 1e-4);
     }
 
     #[test]

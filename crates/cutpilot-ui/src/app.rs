@@ -14,10 +14,13 @@ use crate::filepicker::{self, FolderPickerOutcome, PickerOutcome};
 use crate::mcp_panel::McpPanelState;
 use crate::media_cache::{MediaCache, ProxyState};
 use crate::playback::PlaybackEngine;
+use crate::recorder_panel::{self, RecorderPanelState, RecorderUiAction};
 use crate::timeline::{self, TimelineState, TimelineTool};
 use eframe::egui;
 use cutpilot_core::{AssetKind, Command, Project, Selection, Ticks, TrackKind, TICKS_PER_SEC};
-use cutpilot_engine::{Engine, IpcServer, IpcStats, JobRegistry};
+use cutpilot_engine::{
+    Engine, IpcServer, IpcStats, JobRegistry, LiveRecordingSnapshot, RecordingMonitor,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -138,6 +141,11 @@ pub struct CutPilotApp {
     media_cache: MediaCache,
     timeline_state: TimelineState,
 
+    // Voiceover audio recorder (live monitor off-lock + studio panel state).
+    recording_monitor: RecordingMonitor,
+    recorder_panel: RecorderPanelState,
+    live_recording: LiveRecordingSnapshot,
+
     status: String,
     status_cell: Arc<Mutex<StatusLine>>,
     status_seq: u64,
@@ -177,6 +185,9 @@ impl CutPilotApp {
 
         let engine_inner = Engine::new();
         let jobs = engine_inner.jobs();
+        let recording_monitor = engine_inner.recording_monitor();
+        let mut recorder_panel = RecorderPanelState::default();
+        recorder_panel.refresh_devices(&cc.egui_ctx);
         {
             let wake_ctx = cc.egui_ctx.clone();
             if let Ok(mut reg) = jobs.lock() {
@@ -220,6 +231,9 @@ impl CutPilotApp {
             playback: PlaybackEngine::new(cc.egui_ctx.clone()),
             media_cache: MediaCache::new(),
             timeline_state: TimelineState::default(),
+            recording_monitor,
+            recorder_panel,
+            live_recording: LiveRecordingSnapshot::default(),
             status: initial_status.clone(),
             status_cell: Arc::new(Mutex::new(StatusLine {
                 seq: 1,
@@ -570,6 +584,162 @@ impl CutPilotApp {
     }
 
     // ------------------------------------------------------------------
+    // Voiceover audio recording (routed through Engine::execute)
+    // ------------------------------------------------------------------
+
+    fn ensure_project_for_recording(&mut self) -> bool {
+        if self.cached_project.is_some() {
+            return true;
+        }
+        let base_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| {
+                let vids = h.join("Videos");
+                if vids.is_dir() { vids } else { h }
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let dir = unique_project_dir(&base_dir, "Voiceover");
+        self.exec(Command::CreateProject {
+            name: "Voiceover".into(),
+            path: dir,
+            width: Some(1920),
+            height: Some(1080),
+            fps_num: Some(30),
+            fps_den: Some(1),
+        });
+        self.playback.invalidate_cache();
+        self.cached_project.is_some()
+    }
+
+    fn handle_recorder_action(&mut self, action: RecorderUiAction, ctx: &egui::Context) {
+        match action {
+            RecorderUiAction::None => {}
+            RecorderUiAction::RequestStart => {
+                if self.live_recording.recording {
+                    return;
+                }
+                if !self.ensure_project_for_recording() {
+                    return;
+                }
+                if self.playback.is_playing() {
+                    self.playback.stop_playback();
+                }
+                if self.recorder_panel.countdown_secs > 0 {
+                    self.recorder_panel.begin_countdown();
+                    self.report(format!(
+                        "Voiceover countdown ({}s)…",
+                        self.recorder_panel.countdown_secs
+                    ));
+                    ctx.request_repaint();
+                } else {
+                    self.start_voiceover_recording(ctx);
+                }
+            }
+            RecorderUiAction::StartNow => {
+                self.start_voiceover_recording(ctx);
+            }
+            RecorderUiAction::StopAndInsert => {
+                self.stop_voiceover_recording(false);
+            }
+            RecorderUiAction::Discard => {
+                if self.recorder_panel.is_counting_down() {
+                    self.recorder_panel.cancel_countdown();
+                    self.report("Cancelled voiceover countdown.");
+                } else if self.live_recording.recording {
+                    self.stop_voiceover_recording(true);
+                }
+            }
+            RecorderUiAction::UpdateLiveGain(gain) => {
+                self.recording_monitor.set_live_gain(gain);
+            }
+        }
+    }
+
+    fn start_voiceover_recording(&mut self, ctx: &egui::Context) {
+        if !self.ensure_project_for_recording() {
+            return;
+        }
+        if self.playback.is_playing() {
+            self.playback.stop_playback();
+        }
+        let insert_at = self
+            .cached_project
+            .as_ref()
+            .map(|p| p.editor.playhead_ticks)
+            .unwrap_or(0);
+        let name = {
+            let trimmed = self.recorder_panel.take_name.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        let device = if self.recorder_panel.selected_device == "default" {
+            None
+        } else {
+            Some(self.recorder_panel.selected_device.clone())
+        };
+        let cmd = Command::StartAudioRecording {
+            name,
+            device,
+            track_id: self.recorder_panel.target_track,
+            insert_at_ticks: Some(insert_at),
+            sample_rate: Some(self.recorder_panel.sample_rate),
+            channels: Some(self.recorder_panel.channels),
+            auto_place: Some(true),
+            input_gain: Some(self.recorder_panel.input_gain),
+            studio_voice: Some(self.recorder_panel.studio_voice),
+        };
+        self.exec(cmd);
+        self.live_recording = self.recording_monitor.snapshot();
+
+        if self.live_recording.recording && self.recorder_panel.play_video_while_recording {
+            if let Some(project) = self.cached_project.clone() {
+                if project.timeline_end() > insert_at {
+                    if self.recorder_panel.mute_timeline_while_recording {
+                        self.recorder_panel.saved_playback_muted = Some(self.playback.muted);
+                        self.playback.muted = true;
+                    }
+                    let proxies = self.media_cache.ready_proxy_map();
+                    self.playback.start_playback(&project, &proxies, ctx);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn set_clip_volume(&mut self, clip_id: Uuid, volume: f32) {
+        self.exec(Command::UpdateClip {
+            clip_id,
+            volume: Some(volume.clamp(0.0, 4.0)),
+            opacity: None,
+            scale: None,
+            x_offset: None,
+            y_offset: None,
+            fade_in_ticks: None,
+            fade_out_ticks: None,
+            rotation_deg: None,
+            flip_h: None,
+            flip_v: None,
+            crop: None,
+        });
+    }
+
+    fn stop_voiceover_recording(&mut self, discard: bool) {
+        if self.playback.is_playing() {
+            self.playback.stop_playback();
+        }
+        if let Some(prev_muted) = self.recorder_panel.saved_playback_muted.take() {
+            self.playback.muted = prev_muted;
+        }
+        self.exec(Command::StopAudioRecording {
+            discard: Some(discard),
+        });
+        self.live_recording = self.recording_monitor.snapshot();
+    }
+
+    // ------------------------------------------------------------------
     // Keyboard shortcuts
     // ------------------------------------------------------------------
 
@@ -579,7 +749,7 @@ impl CutPilotApp {
         }
 
         // File-level shortcuts work even before a project is open.
-        let (cmd_mod, shift, key_n, key_o, key_i, key_s) = ctx.input(|i| {
+        let (cmd_mod, shift, key_n, key_o, key_i, key_s, key_r, key_esc) = ctx.input(|i| {
             (
                 i.modifiers.command || i.modifiers.ctrl,
                 i.modifiers.shift,
@@ -587,8 +757,24 @@ impl CutPilotApp {
                 i.key_pressed(egui::Key::O),
                 i.key_pressed(egui::Key::I),
                 i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::Escape),
             )
         });
+        if key_esc && (self.live_recording.recording || self.recorder_panel.is_counting_down()) {
+            self.handle_recorder_action(RecorderUiAction::Discard, ctx);
+            return;
+        }
+        if !cmd_mod && key_r {
+            if self.live_recording.recording {
+                self.handle_recorder_action(RecorderUiAction::StopAndInsert, ctx);
+            } else if self.recorder_panel.is_counting_down() {
+                self.handle_recorder_action(RecorderUiAction::Discard, ctx);
+            } else {
+                self.handle_recorder_action(RecorderUiAction::RequestStart, ctx);
+            }
+            return;
+        }
         if cmd_mod && key_n {
             self.open_folder_picker(FolderPickerPurpose::NewProjectLocation);
             return;
@@ -698,7 +884,11 @@ impl CutPilotApp {
         }
 
         if space {
-            self.toggle_play(ctx);
+            if self.live_recording.recording {
+                self.handle_recorder_action(RecorderUiAction::StopAndInsert, ctx);
+            } else {
+                self.toggle_play(ctx);
+            }
         } else if key_k {
             self.playback.stop_playback();
         } else if key_l {
@@ -839,6 +1029,30 @@ impl CutPilotApp {
                     .clicked()
                 {
                     self.open_file_picker();
+                    ui.close();
+                }
+                ui.separator();
+                let rec_label = if self.live_recording.recording {
+                    "Stop Voiceover Recording"
+                } else {
+                    "Record Voiceover"
+                };
+                if ui
+                    .add(egui::Button::new(rec_label).shortcut_text("R"))
+                    .clicked()
+                {
+                    let act = if self.live_recording.recording {
+                        RecorderUiAction::StopAndInsert
+                    } else {
+                        RecorderUiAction::RequestStart
+                    };
+                    let ctx = ui.ctx().clone();
+                    self.handle_recorder_action(act, &ctx);
+                    ui.close();
+                }
+                if ui.button("Voiceover Studio…").clicked() {
+                    self.recorder_panel.open = true;
+                    self.recorder_panel.refresh_devices(ui.ctx());
                     ui.close();
                 }
             });
@@ -1035,6 +1249,16 @@ impl CutPilotApp {
                 .clicked()
             {
                 self.open_file_picker();
+            }
+
+            ui.separator();
+
+            // Voiceover audio recorder controls right in the top bar!
+            let rec_snap = self.live_recording.clone();
+            let rec_act = self.recorder_panel.top_bar_controls(ui, &rec_snap);
+            if rec_act != RecorderUiAction::None {
+                let ctx = ui.ctx().clone();
+                self.handle_recorder_action(rec_act, &ctx);
             }
 
             ui.separator();
@@ -1740,6 +1964,129 @@ impl CutPilotApp {
                 );
                 ui.add_space(4.0);
 
+                let is_audio_clip = project
+                    .track(&clip.track_id)
+                    .map(|t| t.kind == TrackKind::Audio)
+                    .unwrap_or(false);
+
+                // Resolve the authoritative clip for volume adjustment:
+                // - Audio clip -> itself
+                // - Linked video clip -> its linked Audio track partner (which drives playback & export!)
+                // - Unlinked video clip with embedded audio -> itself
+                let audio_target_clip = if is_audio_clip {
+                    Some(clip.clone())
+                } else if let Some(group) = clip.link_group {
+                    project
+                        .clips
+                        .iter()
+                        .find(|c| {
+                            c.link_group == Some(group)
+                                && c.id != clip.id
+                                && project
+                                    .track(&c.track_id)
+                                    .map(|t| t.kind == TrackKind::Audio)
+                                    .unwrap_or(false)
+                        })
+                        .cloned()
+                        .or_else(|| Some(clip.clone()))
+                } else if project
+                    .asset(&clip.asset_id)
+                    .and_then(|a| a.probe.as_ref())
+                    .map(|p| p.has_audio)
+                    .unwrap_or(false)
+                {
+                    Some(clip.clone())
+                } else {
+                    None
+                };
+
+                // ---- Prominent Audio Level Card (right at top for audio clips!) ----
+                if let Some(vol_clip) = audio_target_clip {
+                    ui.add_space(4.0);
+                    let card_inner_w = (ui.available_width() - 18.0).max(160.0);
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(24, 34, 30))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 8))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(54, 118, 86),
+                        ))
+                        .show(ui, |ui| {
+                            ui.set_max_width(card_inner_w);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("🔊 Audio Volume")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(130, 235, 175)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} ({})",
+                                                timeline::format_volume_pct(vol_clip.volume),
+                                                timeline::format_volume_db(vol_clip.volume),
+                                            ))
+                                            .monospace()
+                                            .small()
+                                            .strong(),
+                                        );
+                                    },
+                                );
+                            });
+                            let mut pct = (vol_clip.volume * 100.0).round();
+                            ui.horizontal(|ui| {
+                                let muted = vol_clip.volume <= 0.001;
+                                if ui
+                                    .small_button(if muted { "🔇" } else { "🔊" })
+                                    .on_hover_text(if muted {
+                                        "Unmute clip (100%)"
+                                    } else {
+                                        "Mute clip (0%)"
+                                    })
+                                    .clicked()
+                                {
+                                    self.set_clip_volume(
+                                        vol_clip.id,
+                                        if muted { 1.0 } else { 0.0 },
+                                    );
+                                }
+                                ui.spacing_mut().slider_width = (card_inner_w - 40.0).max(80.0);
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut pct, 0.0..=300.0)
+                                            .show_value(false),
+                                    )
+                                    .on_hover_text("Drag to adjust clip volume (0%–300%)")
+                                    .changed()
+                                {
+                                    self.set_clip_volume(vol_clip.id, (pct / 100.0).clamp(0.0, 4.0));
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for (lbl, val) in [
+                                    ("Mute", 0.0_f32),
+                                    ("−12 dB", 0.251),
+                                    ("−6 dB", 0.501),
+                                    ("0 dB", 1.0),
+                                    ("+3 dB", 1.413),
+                                    ("+6 dB", 2.0),
+                                ] {
+                                    let active = (vol_clip.volume - val).abs() < 0.03;
+                                    if ui
+                                        .add(egui::Button::new(lbl).small().selected(active))
+                                        .clicked()
+                                    {
+                                        self.set_clip_volume(vol_clip.id, val);
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+
                 if let Some(new_start) =
                     timeline::seconds_field(ui, "Timeline start", clip.timeline_start)
                 {
@@ -1809,11 +2156,6 @@ impl CutPilotApp {
                         self.ripple_delete_clip(clip.id);
                     }
                 });
-
-                let is_audio_clip = project
-                    .track(&clip.track_id)
-                    .map(|t| t.kind == TrackKind::Audio)
-                    .unwrap_or(false);
 
                 ui.horizontal_wrapped(|ui| {
                     if is_audio_clip {
@@ -1978,28 +2320,6 @@ impl CutPilotApp {
                         });
                     }
                 }
-
-                ui.add_space(4.0);
-                let mut volume = clip.volume;
-                ui.horizontal(|ui| {
-                    ui.label("Volume");
-                    if ui.add(egui::Slider::new(&mut volume, 0.0..=2.0)).changed() {
-                        self.exec(Command::UpdateClip {
-                            clip_id: clip.id,
-                            volume: Some(volume),
-                            opacity: None,
-                            scale: None,
-                            x_offset: None,
-                            y_offset: None,
-                            fade_in_ticks: None,
-                            fade_out_ticks: None,
-                            rotation_deg: None,
-                            flip_h: None,
-                            flip_v: None,
-                            crop: None,
-                        });
-                    }
-                });
 
                 if !is_audio_clip {
                     ui.add_space(4.0);
@@ -2994,6 +3314,59 @@ impl CutPilotApp {
             egui::Color32::from_rgba_unmultiplied(220, 225, 240, 180),
         );
 
+        // Live Voiceover REC badge in top-left corner of viewport.
+        if self.live_recording.recording {
+            let rec_txt = format!(
+                "● REC {}  ({:.1} dB)",
+                recorder_panel::format_mmss_tenths(self.live_recording.elapsed_secs),
+                self.live_recording.db
+            );
+            let pill = egui::Rect::from_min_size(
+                vp_rect.left_top() + egui::vec2(10.0, 8.0),
+                egui::vec2(178.0, 22.0),
+            );
+            painter.rect_filled(
+                pill,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(180, 32, 38, 220),
+            );
+            painter.text(
+                pill.center(),
+                egui::Align2::CENTER_CENTER,
+                rec_txt,
+                egui::FontId::monospace(11.5),
+                egui::Color32::WHITE,
+            );
+        } else if let Some(rem) = self.recorder_panel.countdown_remaining_secs() {
+            let badge_rect =
+                egui::Rect::from_center_size(vp_rect.center(), egui::vec2(116.0, 116.0));
+            painter.rect_filled(
+                badge_rect,
+                18.0,
+                egui::Color32::from_rgba_unmultiplied(15, 18, 24, 215),
+            );
+            painter.rect_stroke(
+                badge_rect,
+                18.0,
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(245, 95, 85)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                badge_rect.center() - egui::vec2(0.0, 8.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{rem}"),
+                egui::FontId::proportional(54.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                badge_rect.center() + egui::vec2(0.0, 34.0),
+                egui::Align2::CENTER_CENTER,
+                "VOICEOVER",
+                egui::FontId::monospace(10.5),
+                egui::Color32::from_rgb(255, 150, 145),
+            );
+        }
+
         // Live Caption Overlay (scaled cleanly to preview rect).
         let active_caps = project.captions_at(playhead);
         if !active_caps.is_empty() {
@@ -3072,6 +3445,32 @@ impl CutPilotApp {
                 self.toggle_play(&ctx);
             }
 
+            let is_rec = self.live_recording.recording;
+            let rec_label = if is_rec { "⏹ Stop" } else { "⏺ Rec" };
+            let rec_btn = egui::Button::new(
+                egui::RichText::new(rec_label)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if is_rec {
+                egui::Color32::from_rgb(225, 52, 56)
+            } else {
+                egui::Color32::from_rgb(138, 38, 44)
+            })
+            .min_size(egui::vec2(68.0, 24.0));
+            if ui
+                .add(rec_btn)
+                .on_hover_text("Record / Stop voiceover at playhead (R)")
+                .clicked()
+            {
+                let act = if is_rec {
+                    RecorderUiAction::StopAndInsert
+                } else {
+                    RecorderUiAction::RequestStart
+                };
+                self.handle_recorder_action(act, &ctx);
+            }
+
             if ui.button("1f ▶").on_hover_text("Next frame (Right)").clicked() {
                 self.seek_to((playhead + frame).min(end));
             }
@@ -3123,8 +3522,16 @@ impl eframe::App for CutPilotApp {
             }
         }
 
-        // 2. Refresh non-blocking project snapshot from the Engine.
+        // 2. Refresh non-blocking project snapshot & live voiceover recording state.
         self.refresh_snapshot();
+        self.live_recording = self.recording_monitor.snapshot();
+        let polled_rec_act = self.recorder_panel.poll(&ctx);
+        if polled_rec_act != RecorderUiAction::None {
+            self.handle_recorder_action(polled_rec_act, &ctx);
+        }
+        if self.live_recording.recording {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
 
         // 3. Poll file picker worker.
         let picked = self.picker_rx.as_ref().and_then(|rx| match rx.try_recv() {
@@ -3208,6 +3615,18 @@ impl eframe::App for CutPilotApp {
                 }
             }
         } else {
+            if self.live_recording.recording {
+                // Keep playhead tracking the growing voiceover clip even when
+                // recording past timeline end or on an empty timeline.
+                let rec_head =
+                    self.live_recording.insert_at_ticks + self.live_recording.elapsed_ticks;
+                if let Ok(mut eng) = self.engine.try_lock() {
+                    let _ = eng.execute(Command::SetPlayhead { ticks: rec_head });
+                    if let Some(p) = &mut self.cached_project {
+                        p.editor.playhead_ticks = rec_head;
+                    }
+                }
+            }
             self.playback.poll_scrub(&ctx);
         }
 
@@ -3254,7 +3673,14 @@ impl eframe::App for CutPilotApp {
             .default_size(260.0)
             .min_size(200.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.media_bin(ui));
+                let locked_w = ui.available_width();
+                ui.set_max_width(locked_w);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width((locked_w - 12.0).max(160.0));
+                        self.media_bin(ui);
+                    });
             });
 
         // 9. Right Inspector + Export.
@@ -3262,7 +3688,14 @@ impl eframe::App for CutPilotApp {
             .default_size(310.0)
             .min_size(240.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+                let locked_w = ui.available_width();
+                ui.set_max_width(locked_w);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width((locked_w - 12.0).max(200.0));
+                        self.inspector(ui);
+                    });
             });
 
         // 10. Bottom Timeline Panel.
@@ -3291,6 +3724,7 @@ impl eframe::App for CutPilotApp {
                         self.media_cache.waveforms(),
                         &filmstrips,
                         self.dragging_asset,
+                        Some(&self.live_recording),
                     )
                 };
                 if let Some((asset_id, track_id, at_ticks)) = action.drop_asset {
@@ -3430,6 +3864,19 @@ impl eframe::App for CutPilotApp {
                         flip_h: None,
                         flip_v: None,
                         crop: None,
+                    });
+                }
+                if let Some((cid, vol)) = action.set_clip_volume {
+                    self.set_clip_volume(cid, vol);
+                }
+                if let Some((tid, vol)) = action.set_track_volume {
+                    self.exec(Command::UpdateTrack {
+                        track_id: tid,
+                        name: None,
+                        muted: None,
+                        hidden: None,
+                        locked: None,
+                        volume: Some(vol.clamp(0.0, 4.0)),
                     });
                 }
                 if let Some(aid) = action.cut_silence_asset {
@@ -3651,6 +4098,15 @@ impl eframe::App for CutPilotApp {
         // 13b. Connect MCP Agent modal window.
         self.mcp_panel
             .show(&ctx, &self.ipc_stats, self.cached_project_dir.as_deref());
+
+        // 13c. Voiceover Studio floating window.
+        let rec_snap = self.live_recording.clone();
+        let studio_act =
+            self.recorder_panel
+                .show(&ctx, self.cached_project.as_ref(), &rec_snap);
+        if studio_act != RecorderUiAction::None {
+            self.handle_recorder_action(studio_act, &ctx);
+        }
 
         // 14. Modal spinner overlay locking the UI while HyperFrames renders.
         if hyperframes_busy {

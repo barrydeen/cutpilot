@@ -142,6 +142,34 @@ pub struct TranscriptToCaptionsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AudioRecordStartParams {
+    /// Optional take name (saved as `<project>/recordings/<name>.wav`). Defaults to `voiceover-001`, `voiceover-002`, etc.
+    pub name: Option<String>,
+    /// Optional audio input device id from `audio_inputs_list`. Omit or pass `"default"` for the OS default microphone.
+    pub device: Option<String>,
+    /// Optional audio track uuid to place the voiceover on. Omit to auto-pick a free audio track or create a `Voiceover` track.
+    pub track_id: Option<String>,
+    /// Timeline tick where the voiceover clip will be placed when recording stops. Defaults to the current playhead.
+    pub insert_at_ticks: Option<i64>,
+    /// Sample rate in Hz (8000..=192000). Defaults to the project audio sample rate (48000).
+    pub sample_rate: Option<u32>,
+    /// Channel count: `1` = mono (default, recommended for voiceover), `2` = stereo.
+    pub channels: Option<u16>,
+    /// Automatically place the recorded voiceover clip onto the timeline on stop. Default true.
+    pub auto_place: Option<bool>,
+    /// Linear microphone input level (`0.05..=3.0`). Defaults to `0.65` (~-3.7 dB) for clean headroom on hot mics.
+    pub input_gain: Option<f32>,
+    /// Enable automatic Studio Voice processing (real-time rumble filter + auto-leveling + anti-clipping limiter, plus broadcast denoise/EQ/loudness polish on stop). Default true.
+    pub studio_voice: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AudioRecordStopParams {
+    /// Set `true` to cancel and delete the current recording without adding it to the project. Default false.
+    pub discard: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TrackAddParams {
     /// `video` or `audio`.
     pub track_kind: String,

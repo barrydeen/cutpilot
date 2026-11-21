@@ -387,6 +387,53 @@ impl CutPilotServer {
         .await
     }
 
+    #[tool(description = "List available audio input devices (microphones) and recording backends for live voiceover capture.")]
+    async fn audio_inputs_list(
+        &self,
+        _params: Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        exec(self, Command::ListAudioInputs {}, None).await
+    }
+
+    #[tool(description = "Start recording a live voiceover WAV file into `<project>/recordings/`. Poll live VU levels with `audio_record_status`, then call `audio_record_stop` to finalize, probe, import, and insert the voiceover onto an audio track at `insert_at_ticks` (default: current playhead) in one undoable step.")]
+    async fn audio_record_start(
+        &self,
+        Parameters(p): Parameters<AudioRecordStartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let track_id = match p.track_id {
+            Some(s) => Some(uuid_field(&s, "track")?),
+            None => None,
+        };
+        let cmd = Command::StartAudioRecording {
+            name: p.name,
+            device: p.device,
+            track_id,
+            insert_at_ticks: p.insert_at_ticks,
+            sample_rate: p.sample_rate,
+            channels: p.channels,
+            auto_place: p.auto_place,
+            input_gain: p.input_gain,
+            studio_voice: p.studio_voice,
+        };
+        exec(self, cmd, None).await
+    }
+
+    #[tool(description = "Get live audio recording status, elapsed ticks/seconds, and peak/RMS/dB input meter levels.")]
+    async fn audio_record_status(
+        &self,
+        _params: Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        exec(self, Command::GetRecordingStatus {}, None).await
+    }
+
+    #[tool(description = "Stop the active voiceover recording. By default (`discard: false`), finalizes the WAV file, probes it, imports it into the Media Bin, and inserts it onto the timeline as one undoable step. Pass `discard: true` to cancel and delete the take.")]
+    async fn audio_record_stop(
+        &self,
+        Parameters(p): Parameters<AudioRecordStopParams>,
+    ) -> Result<CallToolResult, McpError> {
+        exec(self, Command::StopAudioRecording { discard: p.discard }, None).await
+    }
+
     #[tool(description = "Add a track (`video` or `audio`). Video tracks composite back-to-front by track index: the lowest-index video track (V1) is the back-most base layer, and higher-index video tracks (V2, V3, …) composite in front on top. Audio tracks all mix together.")]
     async fn track_add(
         &self,

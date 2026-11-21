@@ -41,6 +41,7 @@ real time with shared Undo/Redo history. Pass `--standalone` (or set
 | System | `system_capabilities` |
 | Project | `project_create`, `project_open`, `project_save`, `project_close`, `project_get`, `project_update_settings` |
 | Media | `media_import`, `media_remove`, `media_list`, `media_probe`, `media_detect_silence`, `media_thumbnail`, `media_contact_sheet`, `media_waveform`, `media_transcribe` |
+| Audio Recorder | `audio_inputs_list`, `audio_record_start`, `audio_record_status`, `audio_record_stop` |
 | Transcript | `transcript_get`, `transcript_to_captions` |
 | Tracks | `track_add`, `track_update`, `track_move`, `track_remove` |
 | Clips | `clip_insert`, `clip_move`, `clip_trim`, `clip_split`, `clip_remove`, `clip_update`, `clip_zoom_pan`, `clip_set_speed`, `clip_color_grade`, `clip_duplicate`, `clip_unlink` |
@@ -150,8 +151,16 @@ hyperframes_create {
 clip's start (fade in) or end (fade out) and a duration. Find cut points via
 `timeline_get` → `tracks[0].clips[].timeline_start/timeline_end`.
 
-## Workflow 5 — music, voiceover & WAV audio
+## Workflow 5 — music, voiceover recording & WAV audio
 
+**Built-in voiceover recorder (UI + MCP):**
+- `audio_inputs_list` enumerates available microphones and capture backends (`parecord`, `pw-record`, `arecord`, `ffmpeg`).
+- `audio_record_start { name, device, track_id, insert_at_ticks, sample_rate, channels, auto_place, input_gain, studio_voice }` starts capturing 32-bit float audio through CutPilot's real-time studio input strip (80 Hz rumble filter, live input gain [default `0.65`], auto-leveling, and transparent anti-clipping limiter) into `<project>/recordings/<name>.wav`.
+- `audio_record_status` returns live elapsed ticks/seconds and peak/RMS/dB VU meter levels.
+- `audio_record_stop { discard: false }` finalizes the WAV, runs the automatic **Studio Voice** mastering pass when `studio_voice` is enabled (gentle noise reduction, vocal clarity EQ, compression, and `-16 LUFS` broadcast loudness normalization), probes it with `ffprobe`, imports it into the Media Bin, and inserts it onto a free unlocked audio track (creating a dedicated `Voiceover` track if existing audio tracks are busy at that range) in one undoable step. Pass `discard: true` to cancel and delete the take.
+- In `cutpilot-ui`, press **🎙 Record VO** (or `R`) for one-click recording with Studio Voice enabled by default, a live **Mic Level** slider, optional 3-second countdown, synchronized video playback, and real-time growing waveform preview directly on the timeline. Adjust any audio clip's volume by dragging its horizontal volume line directly on the timeline, via the audio track header slider, right-click `Volume` menu, or Inspector.
+
+**Importing existing audio files:**
 `media_import` any audio file (`.wav`, `.mp3`, `.flac`, `.aac`, `.ogg`, etc.):
 - With `auto_place: true`, it lands in the Media Bin and automatically onto an
   unlocked empty audio track (`A1` if empty, or a freshly created `A2` at tick

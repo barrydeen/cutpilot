@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod hyperframes;
 pub mod process;
 pub mod proxy;
+pub mod record;
 pub mod silence;
 pub mod srt;
 pub mod waveform;

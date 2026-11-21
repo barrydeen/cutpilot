@@ -8,6 +8,7 @@ mod filepicker;
 mod mcp_panel;
 mod media_cache;
 mod playback;
+mod recorder_panel;
 mod timeline;
 
 use eframe::egui;

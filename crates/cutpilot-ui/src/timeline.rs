@@ -14,6 +14,7 @@
 use crate::media_cache::{FilmstripTileRequest, FilmstripView};
 use eframe::egui;
 use cutpilot_core::{AssetKind, Clip, Project, Selection, Ticks, TrackKind, TICKS_PER_SEC};
+use cutpilot_engine::LiveRecordingSnapshot;
 use cutpilot_media::waveform::Peak;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -35,7 +36,7 @@ pub enum TimelineTool {
     Razor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragMode {
     Scrub,
     MoveClip {
@@ -48,6 +49,11 @@ pub enum DragMode {
     TrimRight {
         clip_id: Uuid,
     },
+    AdjustVolume {
+        clip_id: Uuid,
+        top_y: f32,
+        bottom_y: f32,
+    },
 }
 
 /// Persistent UI interaction state for the timeline.
@@ -59,6 +65,7 @@ pub struct TimelineState {
     pub drag: Option<DragMode>,
     pub drag_current_ticks: Option<Ticks>,
     pub drag_target_track: Option<Uuid>,
+    pub drag_volume: Option<f32>,
     pub snap_guide_ticks: Option<Ticks>,
 }
 
@@ -72,6 +79,7 @@ impl Default for TimelineState {
             drag: None,
             drag_current_ticks: None,
             drag_target_track: None,
+            drag_volume: None,
             snap_guide_ticks: None,
         }
     }
@@ -128,6 +136,10 @@ pub struct TimelineAction {
     pub set_audio_fade_in: Option<(Uuid, Ticks)>,
     /// (clip_id, fade_out_ticks) for audio clip fade-out
     pub set_audio_fade_out: Option<(Uuid, Ticks)>,
+    /// (clip_id, linear_volume 0.0..=4.0) from dragging an audio clip's volume line or menu
+    pub set_clip_volume: Option<(Uuid, f32)>,
+    /// (track_id, linear_volume 0.0..=4.0) from an audio track header slider
+    pub set_track_volume: Option<(Uuid, f32)>,
     /// Dragged asset from the Media Bin dropped onto a timeline track:
     /// (asset_id, track_id, timeline_start)
     pub drop_asset: Option<(Uuid, Uuid, Ticks)>,
@@ -152,9 +164,19 @@ pub struct TimelineLayout {
     pub tracks_top_offset: f32,
 }
 
-pub fn compute_layout(project: &Project, available_width: f32) -> TimelineLayout {
+pub fn compute_layout(
+    project: &Project,
+    available_width: f32,
+    live_recording: Option<&LiveRecordingSnapshot>,
+) -> TimelineLayout {
     let zoom = project.editor.zoom_pixels_per_second.clamp(MIN_ZOOM, MAX_ZOOM);
-    let duration_secs = cutpilot_core::secs_from_ticks(project.timeline_end().max(TICKS_PER_SEC * 5));
+    let rec_end = live_recording
+        .filter(|r| r.recording)
+        .map(|r| r.insert_at_ticks + r.elapsed_ticks + TICKS_PER_SEC * 2)
+        .unwrap_or(0);
+    let duration_secs = cutpilot_core::secs_from_ticks(
+        project.timeline_end().max(rec_end).max(TICKS_PER_SEC * 5),
+    );
     let content_width = (duration_secs * zoom as f64) as f32 + 64.0;
     let content_width = content_width.max((available_width - HEADER_WIDTH - 16.0).max(200.0));
     let mut track_y = HashMap::new();
@@ -199,6 +221,7 @@ pub fn draw_timeline(
     waveforms: &HashMap<Uuid, Vec<Peak>>,
     filmstrips: &FilmstripView<'_>,
     dragging_asset: Option<Uuid>,
+    live_recording: Option<&LiveRecordingSnapshot>,
 ) -> TimelineAction {
     let mut action = TimelineAction::default();
     let selected_clip_id = project.editor.selection.iter().find_map(|s| match s {
@@ -211,7 +234,7 @@ pub fn draw_timeline(
     ui.separator();
 
     let available_width = ui.available_width();
-    let layout = compute_layout(project, available_width);
+    let layout = compute_layout(project, available_width, live_recording);
     let tracks_ordered = ordered_tracks(project);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -308,148 +331,214 @@ pub fn draw_timeline(
                                 .show(ui, |ui| {
                                     ui.set_width(HEADER_WIDTH - 12.0);
                                     ui.set_height(TRACK_HEIGHT - 8.0);
-                                    ui.horizontal_centered(|ui| {
-                                        let kind_badge = if track.kind == TrackKind::Video {
-                                            egui::Color32::from_rgb(90, 155, 250)
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 4.0;
+                                        if track.kind == TrackKind::Video {
+                                            ui.add_space(16.0);
                                         } else {
-                                            egui::Color32::from_rgb(80, 200, 135)
-                                        };
-                                        let hover_role = if track.kind == TrackKind::Video {
-                                            if Some(track.id)
-                                                == video_indices.first().map(|(id, _)| *id)
-                                            {
-                                                "Base video track (back-most layer)"
+                                            ui.add_space(4.0);
+                                        }
+                                        ui.horizontal(|ui| {
+                                            let kind_badge = if track.kind == TrackKind::Video {
+                                                egui::Color32::from_rgb(90, 155, 250)
                                             } else {
-                                                "Overlay video track (composited in front of tracks below)"
-                                            }
-                                        } else {
-                                            "Audio track (mixed with all unmuted audio tracks)"
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(&track.name)
-                                                .strong()
-                                                .color(kind_badge),
-                                        )
-                                        .on_hover_text(hover_role);
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.spacing_mut().item_spacing.x = 2.0;
-                                                let lock_col = if track.locked {
-                                                    egui::Color32::from_rgb(245, 175, 70)
+                                                egui::Color32::from_rgb(80, 200, 135)
+                                            };
+                                            let hover_role = if track.kind == TrackKind::Video {
+                                                if Some(track.id)
+                                                    == video_indices.first().map(|(id, _)| *id)
+                                                {
+                                                    "Base video track (back-most layer)"
                                                 } else {
-                                                    egui::Color32::from_gray(120)
+                                                    "Overlay video track (composited in front of tracks below)"
+                                                }
+                                            } else {
+                                                "Audio track (mixed with all unmuted audio tracks)"
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(&track.name)
+                                                    .strong()
+                                                    .color(kind_badge),
+                                            )
+                                            .on_hover_text(hover_role);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                                    let lock_col = if track.locked {
+                                                        egui::Color32::from_rgb(245, 175, 70)
+                                                    } else {
+                                                        egui::Color32::from_gray(120)
+                                                    };
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("L")
+                                                                    .small()
+                                                                    .color(lock_col),
+                                                            )
+                                                            .min_size(egui::vec2(16.0, 18.0)),
+                                                        )
+                                                        .on_hover_text("Lock / unlock track")
+                                                        .clicked()
+                                                    {
+                                                        action.toggle_locked =
+                                                            Some((track.id, !track.locked));
+                                                    }
+                                                    if track.kind == TrackKind::Audio {
+                                                        let mute_col = if track.muted {
+                                                            egui::Color32::from_rgb(245, 95, 95)
+                                                        } else {
+                                                            egui::Color32::from_gray(145)
+                                                        };
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new("M")
+                                                                        .small()
+                                                                        .color(mute_col),
+                                                                )
+                                                                .min_size(egui::vec2(16.0, 18.0)),
+                                                            )
+                                                            .on_hover_text("Mute / unmute audio track")
+                                                            .clicked()
+                                                        {
+                                                            action.toggle_mute =
+                                                                Some((track.id, !track.muted));
+                                                        }
+                                                    } else {
+                                                        let hide_col = if track.hidden {
+                                                            egui::Color32::from_rgb(245, 95, 95)
+                                                        } else {
+                                                            egui::Color32::from_gray(145)
+                                                        };
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new("H")
+                                                                        .small()
+                                                                        .color(hide_col),
+                                                                )
+                                                                .min_size(egui::vec2(16.0, 18.0)),
+                                                            )
+                                                            .on_hover_text("Hide / show video track")
+                                                            .clicked()
+                                                        {
+                                                            action.toggle_hidden =
+                                                                Some((track.id, !track.hidden));
+                                                        }
+                                                    }
+                                                    if up_target.is_some() || down_target.is_some() {
+                                                        let down_tip =
+                                                            if track.kind == TrackKind::Video {
+                                                                "Move track down (farther back)"
+                                                            } else {
+                                                                "Move track down"
+                                                            };
+                                                        if ui
+                                                            .add_enabled(
+                                                                down_target.is_some(),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new("▼")
+                                                                        .small()
+                                                                        .color(
+                                                                            egui::Color32::from_gray(
+                                                                                165,
+                                                                            ),
+                                                                        ),
+                                                                )
+                                                                .min_size(egui::vec2(15.0, 18.0)),
+                                                            )
+                                                            .on_hover_text(down_tip)
+                                                            .clicked()
+                                                        {
+                                                            if let Some(to) = down_target {
+                                                                action.move_track =
+                                                                    Some((track.id, to));
+                                                            }
+                                                        }
+                                                        let up_tip =
+                                                            if track.kind == TrackKind::Video {
+                                                                "Move track up (closer to front)"
+                                                            } else {
+                                                                "Move track up"
+                                                            };
+                                                        if ui
+                                                            .add_enabled(
+                                                                up_target.is_some(),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new("▲")
+                                                                        .small()
+                                                                        .color(
+                                                                            egui::Color32::from_gray(
+                                                                                165,
+                                                                            ),
+                                                                        ),
+                                                                )
+                                                                .min_size(egui::vec2(15.0, 18.0)),
+                                                            )
+                                                            .on_hover_text(up_tip)
+                                                            .clicked()
+                                                        {
+                                                            if let Some(to) = up_target {
+                                                                action.move_track =
+                                                                    Some((track.id, to));
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+
+                                        // Direct per-track volume slider for every audio track!
+                                        if track.kind == TrackKind::Audio {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                let mut tvol = track.volume;
+                                                let icon = if track.muted || tvol <= 0.001 {
+                                                    "🔇"
+                                                } else {
+                                                    "🔊"
                                                 };
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
-                                                            egui::RichText::new("L")
-                                                                .small()
-                                                                .color(lock_col),
+                                                            egui::RichText::new(icon).small(),
                                                         )
-                                                        .min_size(egui::vec2(16.0, 18.0)),
+                                                        .frame(false),
                                                     )
-                                                    .on_hover_text("Lock / unlock track")
+                                                    .on_hover_text("Click to reset track volume to 100%")
                                                     .clicked()
                                                 {
-                                                    action.toggle_locked =
-                                                        Some((track.id, !track.locked));
+                                                    action.set_track_volume = Some((track.id, 1.0));
                                                 }
-                                                if track.kind == TrackKind::Audio {
-                                                    let mute_col = if track.muted {
-                                                        egui::Color32::from_rgb(245, 95, 95)
-                                                    } else {
-                                                        egui::Color32::from_gray(145)
-                                                    };
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                egui::RichText::new("M")
-                                                                    .small()
-                                                                    .color(mute_col),
-                                                            )
-                                                            .min_size(egui::vec2(16.0, 18.0)),
-                                                        )
-                                                        .on_hover_text("Mute / unmute audio track")
-                                                        .clicked()
-                                                    {
-                                                        action.toggle_mute =
-                                                            Some((track.id, !track.muted));
-                                                    }
-                                                } else {
-                                                    let hide_col = if track.hidden {
-                                                        egui::Color32::from_rgb(245, 95, 95)
-                                                    } else {
-                                                        egui::Color32::from_gray(145)
-                                                    };
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                egui::RichText::new("H")
-                                                                    .small()
-                                                                    .color(hide_col),
-                                                            )
-                                                            .min_size(egui::vec2(16.0, 18.0)),
-                                                        )
-                                                        .on_hover_text("Hide / show video track")
-                                                        .clicked()
-                                                    {
-                                                        action.toggle_hidden =
-                                                            Some((track.id, !track.hidden));
-                                                    }
+                                                ui.spacing_mut().slider_width = 72.0;
+                                                let resp = ui
+                                                    .add_enabled(
+                                                        !track.locked,
+                                                        egui::Slider::new(&mut tvol, 0.0..=2.0)
+                                                            .show_value(false),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "{} Track Volume: {} ({})",
+                                                        track.name,
+                                                        format_volume_pct(track.volume),
+                                                        format_volume_db(track.volume)
+                                                    ));
+                                                if resp.changed() {
+                                                    action.set_track_volume =
+                                                        Some((track.id, tvol));
                                                 }
-                                                if up_target.is_some() || down_target.is_some() {
-                                                    let down_tip = if track.kind == TrackKind::Video {
-                                                        "Move track down (farther back)"
-                                                    } else {
-                                                        "Move track down"
-                                                    };
-                                                    if ui
-                                                        .add_enabled(
-                                                            down_target.is_some(),
-                                                            egui::Button::new(
-                                                                egui::RichText::new("▼")
-                                                                    .small()
-                                                                    .color(egui::Color32::from_gray(
-                                                                        165,
-                                                                    )),
-                                                            )
-                                                            .min_size(egui::vec2(15.0, 18.0)),
-                                                        )
-                                                        .on_hover_text(down_tip)
-                                                        .clicked()
-                                                    {
-                                                        if let Some(to) = down_target {
-                                                            action.move_track = Some((track.id, to));
-                                                        }
-                                                    }
-                                                    let up_tip = if track.kind == TrackKind::Video {
-                                                        "Move track up (closer to front)"
-                                                    } else {
-                                                        "Move track up"
-                                                    };
-                                                    if ui
-                                                        .add_enabled(
-                                                            up_target.is_some(),
-                                                            egui::Button::new(
-                                                                egui::RichText::new("▲")
-                                                                    .small()
-                                                                    .color(egui::Color32::from_gray(
-                                                                        165,
-                                                                    )),
-                                                            )
-                                                            .min_size(egui::vec2(15.0, 18.0)),
-                                                        )
-                                                        .on_hover_text(up_tip)
-                                                        .clicked()
-                                                    {
-                                                        if let Some(to) = up_target {
-                                                            action.move_track = Some((track.id, to));
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                        );
+                                                ui.label(
+                                                    egui::RichText::new(format_volume_short(
+                                                        track.volume,
+                                                    ))
+                                                    .monospace()
+                                                    .size(9.5)
+                                                    .color(ui.visuals().weak_text_color()),
+                                                );
+                                            });
+                                        }
                                     });
                                 });
                             ui.add_space(TRACK_GAP);
@@ -625,7 +714,10 @@ pub fn draw_timeline(
 
                 let hover_pos = response.hover_pos();
                 let mut clip_rects: Vec<(Uuid, egui::Rect)> = Vec::new();
+                // (clip_id, top_y, bottom_y, line_y, x0, x1) for audio clip volume lines
+                let mut audio_vol_handles: Vec<(Uuid, f32, f32, f32, f32, f32)> = Vec::new();
                 let mut hovered_edge_cursor = false;
+                let mut hovered_volume_cursor = false;
 
                 for clip in &project.clips {
                     let Some(track) = project.track(&clip.track_id) else {
@@ -686,19 +778,116 @@ pub fn draw_timeline(
                         }
                     }
 
-                    // Detailed audio waveform inside audio clips.
+                    // Detailed audio waveform + draggable horizontal volume line inside audio clips.
+                    let active_drag_vol = match state.drag {
+                        Some(DragMode::AdjustVolume { clip_id, .. }) if clip_id == clip.id => {
+                            state.drag_volume
+                        }
+                        _ => None,
+                    };
+                    let effective_clip_vol = active_drag_vol.unwrap_or(clip.volume);
                     if track.kind == TrackKind::Audio {
                         if let (Some(peaks), Some(asset)) =
                             (waveforms.get(&clip.asset_id), project.asset(&clip.asset_id))
                         {
+                            let mut preview_clip = clip.clone();
+                            preview_clip.volume = (effective_clip_vol * track.volume).clamp(0.0, 4.0);
                             draw_clip_waveform(
                                 &painter,
                                 clip_rect,
                                 clip_vis,
-                                clip,
+                                &preview_clip,
                                 asset.editable_duration(),
                                 peaks,
                             );
+                        }
+
+                        // Draggable horizontal volume rubber-band line (0% at bottom, 100% mid, 200% top).
+                        let wf_top = clip_rect.top() + 18.0;
+                        let wf_bot = clip_rect.bottom() - 4.0;
+                        if wf_bot > wf_top + 8.0 && clip_rect.width() > 14.0 {
+                            let line_y = volume_to_y(effective_clip_vol, wf_top, wf_bot);
+                            let is_dragging_this = active_drag_vol.is_some();
+                            let is_hovering_line = state.tool == TimelineTool::Select
+                                && !track.locked
+                                && hover_pos
+                                    .map(|hp| {
+                                        hp.x >= clip_rect.left() + EDGE_HIT_PX
+                                            && hp.x <= clip_rect.right() - EDGE_HIT_PX
+                                            && (hp.y - line_y).abs() <= 5.5
+                                    })
+                                    .unwrap_or(false);
+                            if is_hovering_line {
+                                hovered_volume_cursor = true;
+                            }
+                            let line_col = if is_dragging_this || is_hovering_line {
+                                egui::Color32::from_rgb(255, 245, 165)
+                            } else if effective_clip_vol <= 0.001 {
+                                egui::Color32::from_rgba_unmultiplied(245, 95, 95, 210)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(242, 222, 130, 175)
+                            };
+                            let stroke_w = if is_dragging_this || is_hovering_line {
+                                2.4
+                            } else {
+                                1.3
+                            };
+                            painter.line_segment(
+                                [
+                                    egui::pos2(clip_rect.left() + 2.0, line_y),
+                                    egui::pos2(clip_rect.right() - 2.0, line_y),
+                                ],
+                                egui::Stroke::new(stroke_w, line_col),
+                            );
+                            if is_dragging_this || is_hovering_line {
+                                let pill_txt = format!(
+                                    "🔊 {} ({})",
+                                    format_volume_pct(effective_clip_vol),
+                                    format_volume_db(effective_clip_vol)
+                                );
+                                let raw_x = hover_pos
+                                    .map(|p| p.x)
+                                    .unwrap_or(clip_rect.center().x);
+                                let min_x = clip_rect.left() + 42.0;
+                                let max_x = clip_rect.right() - 42.0;
+                                let anchor_x = if min_x < max_x {
+                                    raw_x.clamp(min_x, max_x)
+                                } else {
+                                    clip_rect.center().x
+                                };
+                                let pill = egui::Rect::from_center_size(
+                                    egui::pos2(anchor_x, (line_y - 13.0).max(rect.top() + 12.0)),
+                                    egui::vec2(120.0, 17.0),
+                                );
+                                painter.rect_filled(
+                                    pill,
+                                    4.0,
+                                    egui::Color32::from_rgba_unmultiplied(16, 20, 28, 235),
+                                );
+                                painter.rect_stroke(
+                                    pill,
+                                    4.0,
+                                    egui::Stroke::new(1.0, line_col),
+                                    egui::StrokeKind::Inside,
+                                );
+                                painter.text(
+                                    pill.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    pill_txt,
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            if !track.locked {
+                                audio_vol_handles.push((
+                                    clip.id,
+                                    wf_top,
+                                    wf_bot,
+                                    line_y,
+                                    clip_rect.left() + EDGE_HIT_PX,
+                                    clip_rect.right() - EDGE_HIT_PX,
+                                ));
+                            }
                         }
                     }
 
@@ -741,6 +930,16 @@ pub fn draw_timeline(
                         }
                         if !clip.color.is_neutral() {
                             title.push_str(" 🎨");
+                        }
+                        if track.kind == TrackKind::Audio && (effective_clip_vol - 1.0).abs() > 0.02 {
+                            if effective_clip_vol <= 0.001 {
+                                title.push_str(" · 🔇");
+                            } else {
+                                title.push_str(&format!(
+                                    " · 🔊 {}",
+                                    format_volume_db(effective_clip_vol)
+                                ));
+                            }
                         }
                         clipped.text(
                             clip_rect.left_top() + egui::vec2(5.0, 1.5),
@@ -812,6 +1011,82 @@ pub fn draw_timeline(
                     }
 
                     clip_rects.push((clip.id, clip_rect));
+                }
+
+                // ---- Live Voiceover Recording Clip Overlay ----
+                if let Some(rec) = live_recording.filter(|r| r.recording) {
+                    let target_track_id = rec
+                        .target_track_id
+                        .filter(|id| layout.track_y.contains_key(id))
+                        .or_else(|| {
+                            tracks_ordered
+                                .iter()
+                                .rev()
+                                .find(|t| t.kind == TrackKind::Audio)
+                                .map(|t| t.id)
+                        });
+                    if let Some(tid) = target_track_id {
+                        if let Some(&y) = layout.track_y.get(&tid) {
+                            let rx0 = rect.left() + tick_to_x(rec.insert_at_ticks);
+                            let rx1 = (rect.left()
+                                + tick_to_x(rec.insert_at_ticks + rec.elapsed_ticks))
+                            .max(rx0 + 18.0);
+                            let rec_rect = egui::Rect::from_min_max(
+                                egui::pos2(rx0, rect.top() + layout.tracks_top_offset + y + 2.0),
+                                egui::pos2(
+                                    rx1,
+                                    rect.top() + layout.tracks_top_offset + y + TRACK_HEIGHT - 2.0,
+                                ),
+                            );
+                            painter.rect_filled(
+                                rec_rect,
+                                4.0,
+                                egui::Color32::from_rgba_unmultiplied(175, 36, 44, 215),
+                            );
+                            // Draw live recorded waveform inside the growing clip!
+                            if !rec.waveform_peaks.is_empty() && rec_rect.width() > 8.0 {
+                                let wave_top = rec_rect.top() + 17.0;
+                                let wave_bot = rec_rect.bottom() - 4.0;
+                                let mid_y = (wave_top + wave_bot) * 0.5;
+                                let half_h = ((wave_bot - wave_top) * 0.48).max(2.0);
+                                let bars = ((rec_rect.width() - 4.0) / 2.0).floor().max(1.0) as usize;
+                                let peaks = &rec.waveform_peaks;
+                                for b in 0..bars {
+                                    let i0 = (b * peaks.len()) / bars;
+                                    let i1 = (((b + 1) * peaks.len()) / bars)
+                                        .max(i0 + 1)
+                                        .min(peaks.len());
+                                    let mut amp = 0.0_f32;
+                                    for &p in &peaks[i0..i1] {
+                                        amp = amp.max(p);
+                                    }
+                                    let h = (amp.clamp(0.0, 1.0).powf(0.65) * half_h).max(1.0);
+                                    let x = rec_rect.left() + 2.0 + b as f32 * 2.0 + 0.5;
+                                    painter.line_segment(
+                                        [egui::pos2(x, mid_y - h), egui::pos2(x, mid_y + h)],
+                                        egui::Stroke::new(
+                                            1.4,
+                                            egui::Color32::from_rgb(255, 195, 195),
+                                        ),
+                                    );
+                                }
+                            }
+                            painter.rect_stroke(
+                                rec_rect,
+                                4.0,
+                                egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 110, 110)),
+                                egui::StrokeKind::Inside,
+                            );
+                            let clipped = ui.painter_at(rec_rect);
+                            clipped.text(
+                                rec_rect.left_top() + egui::vec2(5.0, 2.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("● REC {} ({:.1}s)", rec.name, rec.elapsed_secs),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
                 }
 
                 // ---- Live Ghost Preview During Move / Trim ----
@@ -1029,6 +1304,10 @@ pub fn draw_timeline(
                 // ---- Cursor feedback ----
                 if state.tool == TimelineTool::Razor && response.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                } else if hovered_volume_cursor
+                    || matches!(state.drag, Some(DragMode::AdjustVolume { .. }))
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 } else if hovered_edge_cursor
                     || matches!(state.drag, Some(DragMode::TrimLeft { .. } | DragMode::TrimRight { .. }))
                 {
@@ -1047,31 +1326,46 @@ pub fn draw_timeline(
                             state.drag = Some(DragMode::Scrub);
                             action.seek = Some(x_to_ticks(x_of(p)));
                         } else {
-                            // Hit-test clips (edges first for trim, then body for move).
+                            // Hit-test audio clip volume rubber-band lines first, then clip edges/body.
                             let mut hit = None;
-                            for (id, r) in &clip_rects {
-                                if r.contains(p) {
-                                    let near_left =
-                                        r.width() > 14.0 && (p.x - r.left()).abs() <= EDGE_HIT_PX;
-                                    let near_right =
-                                        r.width() > 14.0 && (p.x - r.right()).abs() <= EDGE_HIT_PX;
-                                    if near_left {
-                                        hit = Some(DragMode::TrimLeft { clip_id: *id });
-                                    } else if near_right {
-                                        hit = Some(DragMode::TrimRight { clip_id: *id });
-                                    } else {
-                                        let grab = x_to_ticks(x_of(p))
-                                            - project
-                                                .clip(id)
-                                                .map(|c: &Clip| c.timeline_start)
-                                                .unwrap_or(0);
-                                        hit = Some(DragMode::MoveClip {
-                                            clip_id: *id,
-                                            grab_offset_ticks: grab,
-                                        });
-                                    }
-                                    action.select_clip = Some(*id);
+                            for &(cid, top_y, bot_y, line_y, x0, x1) in &audio_vol_handles {
+                                if p.x >= x0 && p.x <= x1 && (p.y - line_y).abs() <= 5.5 {
+                                    hit = Some(DragMode::AdjustVolume {
+                                        clip_id: cid,
+                                        top_y,
+                                        bottom_y: bot_y,
+                                    });
+                                    state.drag_volume =
+                                        Some(y_to_volume(p.y, top_y, bot_y));
+                                    action.select_clip = Some(cid);
                                     break;
+                                }
+                            }
+                            if hit.is_none() {
+                                for (id, r) in &clip_rects {
+                                    if r.contains(p) {
+                                        let near_left =
+                                            r.width() > 14.0 && (p.x - r.left()).abs() <= EDGE_HIT_PX;
+                                        let near_right =
+                                            r.width() > 14.0 && (p.x - r.right()).abs() <= EDGE_HIT_PX;
+                                        if near_left {
+                                            hit = Some(DragMode::TrimLeft { clip_id: *id });
+                                        } else if near_right {
+                                            hit = Some(DragMode::TrimRight { clip_id: *id });
+                                        } else {
+                                            let grab = x_to_ticks(x_of(p))
+                                                - project
+                                                    .clip(id)
+                                                    .map(|c: &Clip| c.timeline_start)
+                                                    .unwrap_or(0);
+                                            hit = Some(DragMode::MoveClip {
+                                                clip_id: *id,
+                                                grab_offset_ticks: grab,
+                                            });
+                                        }
+                                        action.select_clip = Some(*id);
+                                        break;
+                                    }
                                 }
                             }
                             if let Some(mode) = hit {
@@ -1122,6 +1416,10 @@ pub fn draw_timeline(
                                     snap_ticks(raw_t, project, layout.zoom, state.snap, Some(clip_id));
                                 state.drag_current_ticks = Some(snapped);
                                 state.snap_guide_ticks = guide;
+                            }
+                            Some(DragMode::AdjustVolume { top_y, bottom_y, .. }) => {
+                                state.drag_volume = Some(y_to_volume(p.y, top_y, bottom_y));
+                                state.snap_guide_ticks = None;
                             }
                             None => {}
                         }
@@ -1191,11 +1489,17 @@ pub fn draw_timeline(
                                     }
                                 }
                             }
+                            DragMode::AdjustVolume { clip_id, .. } => {
+                                if let Some(vol) = state.drag_volume.take() {
+                                    action.set_clip_volume = Some((clip_id, vol));
+                                }
+                            }
                         }
                     } else {
                         state.drag = None;
                         state.drag_current_ticks = None;
                         state.drag_target_track = None;
+                        state.drag_volume = None;
                     }
                     state.snap_guide_ticks = None;
                 }
@@ -1303,6 +1607,22 @@ pub fn draw_timeline(
                                 .map(|t| t.kind == TrackKind::Audio)
                                 .unwrap_or(false);
                             if is_audio_clip {
+                                ui.menu_button("🔊 Clip Volume", |ui| {
+                                    for (lbl, vol) in [
+                                        ("Mute (0%)", 0.0_f32),
+                                        ("Background (−18 dB · 13%)", 0.126),
+                                        ("Quiet (−12 dB · 25%)", 0.251),
+                                        ("Lower (−6 dB · 50%)", 0.501),
+                                        ("Normal (0 dB · 100%)", 1.0),
+                                        ("Boost (+3 dB · 141%)", 1.413),
+                                        ("Loud (+6 dB · 200%)", 2.0),
+                                    ] {
+                                        if ui.button(lbl).clicked() {
+                                            action.set_clip_volume = Some((cid, vol));
+                                            ui.close();
+                                        }
+                                    }
+                                });
                                 let fade_dur = (TICKS_PER_SEC / 2).min(clip.timeline_duration());
                                 if ui.button("◐ Audio Fade In (0.5s)").clicked() {
                                     action.set_audio_fade_in = Some((cid, fade_dur));
@@ -1537,7 +1857,7 @@ fn draw_drag_ghost(
     };
     let frame = project.settings.fps.frame_duration_ticks().max(1);
     let (clip_id, ghost_start, ghost_end, track_id) = match mode {
-        DragMode::Scrub => return,
+        DragMode::Scrub | DragMode::AdjustVolume { .. } => return,
         DragMode::MoveClip { clip_id, .. } => {
             let Some(c) = project.clip(&clip_id) else { return };
             let tid = state.drag_target_track.unwrap_or(c.track_id);
@@ -1974,6 +2294,54 @@ fn brighten(c: egui::Color32, add: u8) -> egui::Color32 {
         c.g().saturating_add(add),
         c.b().saturating_add(add),
     )
+}
+
+/// Map linear clip volume (`0.0..=2.0`) to a Y position inside an audio clip's waveform band.
+fn volume_to_y(volume: f32, top_y: f32, bottom_y: f32) -> f32 {
+    let frac = (volume.clamp(0.0, 2.0) / 2.0).clamp(0.0, 1.0);
+    bottom_y - frac * (bottom_y - top_y)
+}
+
+/// Map a dragged pointer Y position back to linear clip volume (`0.0..=2.0`),
+/// with a gentle magnetic snap to `1.0` (0 dB / 100%).
+fn y_to_volume(y: f32, top_y: f32, bottom_y: f32) -> f32 {
+    let span = (bottom_y - top_y).max(1.0);
+    let frac = ((bottom_y - y) / span).clamp(0.0, 1.0);
+    let raw = (frac * 2.0).clamp(0.0, 2.0);
+    if (raw - 1.0).abs() < 0.045 {
+        1.0
+    } else if raw < 0.025 {
+        0.0
+    } else {
+        (raw * 100.0).round() / 100.0
+    }
+}
+
+pub fn format_volume_pct(vol: f32) -> String {
+    format!("{:.0}%", (vol.max(0.0) * 100.0).round())
+}
+
+pub fn format_volume_db(vol: f32) -> String {
+    if vol <= 0.0005 {
+        "−∞ dB".into()
+    } else {
+        let db = 20.0 * vol.log10();
+        if db.abs() < 0.05 {
+            "0.0 dB".into()
+        } else if db > 0.0 {
+            format!("+{db:.1} dB")
+        } else {
+            format!("{db:.1} dB")
+        }
+    }
+}
+
+fn format_volume_short(vol: f32) -> String {
+    if vol <= 0.001 {
+        "0%".into()
+    } else {
+        format!("{:.0}%", (vol * 100.0).round())
+    }
 }
 
 /// Small helper used by the inspector: seconds <-> ticks DragValue.

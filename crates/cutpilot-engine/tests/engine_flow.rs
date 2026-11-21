@@ -854,3 +854,130 @@ fn zoom_pan_speed_color_and_classic_edits_render_cleanly() {
 
     std::fs::remove_dir_all(&tmp).ok();
 }
+
+#[test]
+fn voiceover_recording_places_clip_and_supports_undo_and_discard() {
+    require_ffmpeg();
+    let tmp = std::env::temp_dir().join(format!("cutpilot-vo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let media = make_sample_media(&tmp);
+
+    let mut engine = Engine::new();
+    let monitor = engine.recording_monitor();
+    assert!(!monitor.is_recording());
+
+    // Listing audio inputs works even before opening a project.
+    let inputs = engine.execute(Command::ListAudioInputs {}).unwrap();
+    assert!(!inputs.data["devices"].as_array().unwrap().is_empty());
+
+    let project_dir = tmp.join("vo.cutpilot");
+    engine
+        .execute(Command::CreateProject {
+            name: "Voiceover Test".into(),
+            path: project_dir.clone(),
+            width: Some(640),
+            height: Some(360),
+            fps_num: Some(30),
+            fps_den: Some(1),
+        })
+        .unwrap();
+    engine
+        .execute(Command::ImportMedia {
+            path: media,
+            auto_place: Some(true),
+        })
+        .unwrap();
+
+    // Start recording at t = 2s while A1 is occupied by linked camera audio ->
+    // should auto-create a dedicated `Voiceover` track on stop!
+    let started = engine
+        .execute(Command::StartAudioRecording {
+            name: Some("Intro Narration".into()),
+            device: Some(cutpilot_media::record::SYNTHETIC_TEST_DEVICE.into()),
+            track_id: None,
+            insert_at_ticks: Some(TICKS_PER_SEC * 2),
+            sample_rate: Some(48_000),
+            channels: Some(1),
+            auto_place: Some(true),
+            input_gain: Some(0.65),
+            studio_voice: Some(true),
+        })
+        .unwrap();
+    assert_eq!(started.data["name"], "Intro-Narration");
+    assert!(monitor.is_recording());
+
+    // Starting a second recording while one is active must fail cleanly.
+    assert!(engine
+        .execute(Command::StartAudioRecording {
+            name: None,
+            device: Some(cutpilot_media::record::SYNTHETIC_TEST_DEVICE.into()),
+            track_id: None,
+            insert_at_ticks: None,
+            sample_rate: None,
+            channels: None,
+            auto_place: Some(true),
+            input_gain: None,
+            studio_voice: None,
+        })
+        .is_err());
+
+    std::thread::sleep(Duration::from_millis(260));
+    let status = engine.execute(Command::GetRecordingStatus {}).unwrap();
+    assert_eq!(status.data["recording"], true);
+    assert!(status.data["elapsed_ticks"].as_i64().unwrap() > 0);
+    let live_snap = monitor.snapshot();
+    assert!(live_snap.recording);
+    assert!(live_snap.peak > 0.15 && live_snap.peak <= 0.85);
+    assert!(!live_snap.clipping);
+    assert!(!live_snap.waveform_peaks.is_empty());
+
+    let stopped = engine
+        .execute(Command::StopAudioRecording {
+            discard: Some(false),
+        })
+        .unwrap();
+    assert!(!monitor.is_recording());
+    assert_eq!(stopped.data["discarded"], false);
+    assert_eq!(stopped.data["studio_polished"], true);
+    assert_eq!(stopped.data["placed_clip"]["track_name"], "Voiceover");
+    assert_eq!(
+        stopped.data["placed_clip"]["timeline_start"],
+        TICKS_PER_SEC * 2
+    );
+    let wav_path = PathBuf::from(stopped.data["path"].as_str().unwrap());
+    assert!(wav_path.is_file());
+    assert!(wav_path.starts_with(project_dir.join("recordings")));
+
+    // Single Undo step cleanly removes the recorded clip and asset.
+    let before_undo_clips = engine.project().unwrap().clips.len();
+    engine.execute(Command::Undo {}).unwrap();
+    assert_eq!(engine.project().unwrap().clips.len(), before_undo_clips - 1);
+
+    // Discard path deletes the recorded WAV and leaves the project untouched.
+    let rev_before = engine.revision();
+    let started2 = engine
+        .execute(Command::StartAudioRecording {
+            name: Some("flubbed-take".into()),
+            device: Some(cutpilot_media::record::SYNTHETIC_TEST_DEVICE.into()),
+            track_id: None,
+            insert_at_ticks: Some(0),
+            sample_rate: Some(48_000),
+            channels: Some(1),
+            auto_place: Some(true),
+            input_gain: None,
+            studio_voice: None,
+        })
+        .unwrap();
+    let discard_path = PathBuf::from(started2.data["output_path"].as_str().unwrap());
+    std::thread::sleep(Duration::from_millis(120));
+    let discarded = engine
+        .execute(Command::StopAudioRecording {
+            discard: Some(true),
+        })
+        .unwrap();
+    assert_eq!(discarded.data["discarded"], true);
+    assert!(!discard_path.exists());
+    assert_eq!(engine.revision(), rev_before);
+
+    std::fs::remove_dir_all(&tmp).ok();
+}

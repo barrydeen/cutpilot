@@ -7,10 +7,10 @@ use crate::{
     preview, project_io,
 };
 use cutpilot_core::{
-    edit, Asset, AssetKind, Clip, Command, Outcome, Project, ProjectSettings, Ticks, Track,
-    TrackKind, Transcript, SCHEMA_VERSION,
+    edit, Asset, AssetKind, Clip, Command, Outcome, Project, ProjectSettings, Selection, Ticks,
+    Track, TrackKind, Transcript, SCHEMA_VERSION,
 };
-use cutpilot_media::{export, ffprobe, frames, hyperframes, silence, srt, waveform, whisper};
+use cutpilot_media::{export, ffprobe, frames, hyperframes, record, silence, srt, waveform, whisper};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -32,10 +32,158 @@ struct ActiveProject {
     redo: Vec<Snapshot>,
 }
 
+struct ActiveRecording {
+    id: Uuid,
+    name: String,
+    device: String,
+    insert_at_ticks: Ticks,
+    requested_track_id: Option<Uuid>,
+    auto_place: bool,
+    session: record::RecordingSession,
+}
+
+#[derive(Clone)]
+struct ActiveRecordingView {
+    id: Uuid,
+    name: String,
+    output_path: PathBuf,
+    device: String,
+    backend: String,
+    sample_rate: u32,
+    channels: u16,
+    studio_voice: bool,
+    insert_at_ticks: Ticks,
+    target_track_id: Option<Uuid>,
+    auto_place: bool,
+    live_gain: Arc<std::sync::atomic::AtomicU32>,
+    metrics: Arc<Mutex<record::LiveMetrics>>,
+}
+
+/// Non-blocking snapshot of live audio recording state (meters, duration, waveform).
+#[derive(Debug, Clone, Default)]
+pub struct LiveRecordingSnapshot {
+    pub recording: bool,
+    pub recording_id: Option<Uuid>,
+    pub name: String,
+    pub output_path: Option<PathBuf>,
+    pub device: String,
+    pub backend: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub studio_voice: bool,
+    pub insert_at_ticks: Ticks,
+    pub target_track_id: Option<Uuid>,
+    pub auto_place: bool,
+    pub elapsed_ticks: Ticks,
+    pub elapsed_secs: f64,
+    pub peak: f32,
+    pub rms: f32,
+    pub db: f32,
+    pub clipping: bool,
+    pub input_hot: bool,
+    pub waveform_peaks: Vec<f32>,
+    pub error: Option<String>,
+}
+
+impl LiveRecordingSnapshot {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "recording": self.recording,
+            "recording_id": self.recording_id,
+            "name": if self.recording { json!(self.name) } else { Value::Null },
+            "output_path": self.output_path.as_ref().map(|p| p.display().to_string()),
+            "device": if self.recording { json!(self.device) } else { Value::Null },
+            "backend": if self.recording { json!(self.backend) } else { Value::Null },
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "studio_voice": self.studio_voice,
+            "insert_at_ticks": self.insert_at_ticks,
+            "target_track_id": self.target_track_id,
+            "auto_place": self.auto_place,
+            "elapsed_ticks": self.elapsed_ticks,
+            "elapsed_secs": self.elapsed_secs,
+            "peak": self.peak,
+            "rms": self.rms,
+            "db": self.db,
+            "clipping": self.clipping,
+            "input_hot": self.input_hot,
+            "waveform_peak_count": self.waveform_peaks.len(),
+            "error": self.error,
+        })
+    }
+}
+
+/// Lightweight handle cloned by the UI to poll live recording levels at 60fps
+/// without ever locking the [`Engine`].
+#[derive(Clone, Default)]
+pub struct RecordingMonitor {
+    inner: Arc<Mutex<Option<ActiveRecordingView>>>,
+}
+
+impl RecordingMonitor {
+    pub fn snapshot(&self) -> LiveRecordingSnapshot {
+        let view = match self.inner.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(v) = view else {
+            return LiveRecordingSnapshot {
+                db: -96.0,
+                ..Default::default()
+            };
+        };
+        let m = v
+            .metrics
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        LiveRecordingSnapshot {
+            recording: true,
+            recording_id: Some(v.id),
+            name: v.name,
+            output_path: Some(v.output_path),
+            device: v.device,
+            backend: v.backend,
+            sample_rate: v.sample_rate,
+            channels: v.channels,
+            studio_voice: v.studio_voice,
+            insert_at_ticks: v.insert_at_ticks,
+            target_track_id: v.target_track_id,
+            auto_place: v.auto_place,
+            elapsed_ticks: cutpilot_core::ticks_from_secs(m.elapsed_secs),
+            elapsed_secs: m.elapsed_secs,
+            peak: m.peak,
+            rms: m.rms,
+            db: m.db,
+            clipping: m.clipping,
+            input_hot: m.input_hot,
+            waveform_peaks: m.waveform_peaks,
+            error: m.error,
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Nudge microphone input gain live while recording without locking the Engine.
+    pub fn set_live_gain(&self, gain: f32) {
+        let clamped = gain.clamp(record::MIN_INPUT_GAIN, record::MAX_INPUT_GAIN);
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(v) = guard.as_ref() {
+                v.live_gain
+                    .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// The single-writer engine. Wrap in `Arc<Mutex<..>>` for thread access.
 pub struct Engine {
     active: Option<ActiveProject>,
     jobs: Arc<Mutex<JobRegistry>>,
+    recording: Option<ActiveRecording>,
+    recording_view: Arc<Mutex<Option<ActiveRecordingView>>>,
 }
 
 impl Default for Engine {
@@ -49,6 +197,8 @@ impl Engine {
         Self {
             active: None,
             jobs: Arc::new(Mutex::new(JobRegistry::new())),
+            recording: None,
+            recording_view: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -145,6 +295,13 @@ impl Engine {
 
     pub fn jobs(&self) -> Arc<Mutex<JobRegistry>> {
         self.jobs.clone()
+    }
+
+    /// Lightweight monitor for reading live VU levels and recording progress off-lock.
+    pub fn recording_monitor(&self) -> RecordingMonitor {
+        RecordingMonitor {
+            inner: self.recording_view.clone(),
+        }
     }
 
     /// Compute a preview frame (RGBA) at the playhead or a given tick.
@@ -254,6 +411,12 @@ impl Engine {
                 ))
             }
             Command::CloseProject {} => {
+                if let Some(rec) = self.recording.take() {
+                    if let Ok(mut view) = self.recording_view.lock() {
+                        *view = None;
+                    }
+                    rec.session.discard();
+                }
                 self.active = None;
                 Ok(Outcome::new(
                     0,
@@ -509,6 +672,73 @@ impl Engine {
                 let active = self.require_active()?;
                 let data = transcript_json(&active.project, *asset_id)?;
                 Ok(Outcome::new(self.revision(), &kind, data, "transcript"))
+            }
+
+            // ----- audio recording / voiceover -----
+            Command::ListAudioInputs {} => {
+                let caps = record::capabilities();
+                let devices = record::list_input_devices();
+                let data = json!({
+                    "available": caps.available,
+                    "backends": caps.backends,
+                    "devices": devices,
+                });
+                Ok(Outcome::new(
+                    self.revision(),
+                    &kind,
+                    data,
+                    format!("found {} audio input device(s)", devices.len()),
+                ))
+            }
+            Command::StartAudioRecording {
+                name,
+                device,
+                track_id,
+                insert_at_ticks,
+                sample_rate,
+                channels,
+                auto_place,
+                input_gain,
+                studio_voice,
+            } => {
+                let data = self.start_audio_recording(
+                    name.clone(),
+                    device.clone(),
+                    *track_id,
+                    *insert_at_ticks,
+                    *sample_rate,
+                    *channels,
+                    auto_place.unwrap_or(true),
+                    input_gain.unwrap_or(record::DEFAULT_INPUT_GAIN),
+                    studio_voice.unwrap_or(true),
+                )?;
+                Ok(Outcome::new(
+                    self.revision(),
+                    &kind,
+                    data,
+                    "started audio recording",
+                ))
+            }
+            Command::GetRecordingStatus {} => {
+                let snap = self.recording_monitor().snapshot();
+                let msg = if snap.recording {
+                    format!("recording {} ({:.1}s)", snap.name, snap.elapsed_secs)
+                } else {
+                    "not recording".into()
+                };
+                Ok(Outcome::new(self.revision(), &kind, snap.to_json(), msg))
+            }
+            Command::StopAudioRecording { discard } => {
+                let discard = discard.unwrap_or(false);
+                let data = self.stop_audio_recording(discard)?;
+                let msg = if discard {
+                    "discarded audio recording".to_string()
+                } else {
+                    let take = data["name"].as_str().unwrap_or("voiceover");
+                    let dur = data["duration_secs"].as_f64().unwrap_or(0.0);
+                    format!("recorded {take} ({dur:.1}s)")
+                };
+                Ok(Outcome::new(self.revision(), &kind, data, msg))
             }
 
             // ----- captions I/O -----
@@ -785,6 +1015,7 @@ impl Engine {
                 let (has_ffmpeg, has_ffprobe) = cutpilot_media::tool_status();
                 let gpu = cutpilot_media::gpu::capabilities();
                 let wh = whisper::capabilities();
+                let rec = record::capabilities();
                 let data = json!({
                     "cutpilot": env!("CARGO_PKG_VERSION"),
                     "schema_version": SCHEMA_VERSION,
@@ -797,6 +1028,8 @@ impl Engine {
                     "nvdec": gpu.nvdec,
                     "npx_available": hyperframes::sidecar_available(),
                     "gpu": gpu.gpu_name.clone().unwrap_or_else(|| "unknown".into()),
+                    "audio_recording": rec.available,
+                    "audio_recording_backends": rec.backends,
                     "whisper": wh.available,
                     "whisper_backend": wh.backend,
                     "whisper_cpp_version": wh.whisper_cpp_version,
@@ -1559,6 +1792,253 @@ impl Engine {
         Ok(())
     }
 
+    // ----- Audio recording / voiceover -----
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_audio_recording(
+        &mut self,
+        name: Option<String>,
+        device: Option<String>,
+        track_id: Option<Uuid>,
+        insert_at_ticks: Option<Ticks>,
+        sample_rate: Option<u32>,
+        channels: Option<u16>,
+        auto_place: bool,
+        input_gain: f32,
+        studio_voice: bool,
+    ) -> Result<Value, EngineError> {
+        if self.recording.is_some() {
+            return Err(EngineError::Validation(
+                "an audio recording is already in progress; stop or discard it first".into(),
+            ));
+        }
+
+        let (recordings_dir, insert_at, preview_track_id, default_sr) = {
+            let active = self.require_active()?;
+            if let Some(tid) = track_id {
+                let track = active.project.track(&tid).ok_or_else(|| {
+                    EngineError::Validation(format!("unknown track {tid}"))
+                })?;
+                if track.kind != TrackKind::Audio {
+                    return Err(EngineError::Validation(format!(
+                        "track `{}` is not an audio track",
+                        track.name
+                    )));
+                }
+                if track.locked {
+                    return Err(EngineError::Validation(format!(
+                        "track `{}` is locked; unlock it before recording",
+                        track.name
+                    )));
+                }
+            }
+            let at = insert_at_ticks
+                .unwrap_or(active.project.editor.playhead_ticks)
+                .max(0);
+            let preview_tid = track_id.or_else(|| {
+                find_free_voiceover_track(&active.project, at, at + cutpilot_core::TICKS_PER_SEC)
+            });
+            (
+                active.dir.join("recordings"),
+                at,
+                preview_tid,
+                active.project.settings.audio_sample_rate,
+            )
+        };
+
+        let (take_name, output_path) = next_recording_path(&recordings_dir, name.as_deref());
+        let sr = sample_rate.unwrap_or(if default_sr > 0 {
+            default_sr
+        } else {
+            record::DEFAULT_SAMPLE_RATE
+        });
+        let ch = channels.unwrap_or(record::DEFAULT_CHANNELS);
+        let opts = record::RecordOptions {
+            device: device.clone(),
+            sample_rate: sr,
+            channels: ch,
+            input_gain,
+            studio_voice,
+        };
+        let session = record::RecordingSession::start(output_path.clone(), opts)?;
+        let recording_id = Uuid::new_v4();
+        let backend = session.backend().to_string();
+        let dev_label = device
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "default".into());
+        let metrics = session.metrics_handle();
+        let live_gain = session.live_gain_handle();
+
+        let view = ActiveRecordingView {
+            id: recording_id,
+            name: take_name.clone(),
+            output_path: output_path.clone(),
+            device: dev_label.clone(),
+            backend: backend.clone(),
+            sample_rate: sr,
+            channels: ch,
+            studio_voice,
+            insert_at_ticks: insert_at,
+            target_track_id: preview_track_id,
+            auto_place,
+            live_gain,
+            metrics,
+        };
+        if let Ok(mut slot) = self.recording_view.lock() {
+            *slot = Some(view);
+        }
+        self.recording = Some(ActiveRecording {
+            id: recording_id,
+            name: take_name.clone(),
+            device: dev_label.clone(),
+            insert_at_ticks: insert_at,
+            requested_track_id: track_id,
+            auto_place,
+            session,
+        });
+
+        Ok(json!({
+            "recording_id": recording_id,
+            "name": take_name,
+            "output_path": output_path.display().to_string(),
+            "device": dev_label,
+            "backend": backend,
+            "sample_rate": sr,
+            "channels": ch,
+            "input_gain": input_gain,
+            "studio_voice": studio_voice,
+            "insert_at_ticks": insert_at,
+            "track_id": preview_track_id,
+            "auto_place": auto_place,
+        }))
+    }
+
+    fn stop_audio_recording(&mut self, discard: bool) -> Result<Value, EngineError> {
+        let active_rec = self.recording.take().ok_or_else(|| {
+            EngineError::Validation("no audio recording is currently active".into())
+        })?;
+        if let Ok(mut slot) = self.recording_view.lock() {
+            *slot = None;
+        }
+
+        if discard {
+            let recording_id = active_rec.id;
+            active_rec.session.discard();
+            return Ok(json!({
+                "discarded": true,
+                "recording_id": recording_id,
+            }));
+        }
+
+        let recording_id = active_rec.id;
+        let take_name = active_rec.name;
+        let insert_at = active_rec.insert_at_ticks;
+        let requested_track_id = active_rec.requested_track_id;
+        let auto_place = active_rec.auto_place;
+        let device = active_rec.device;
+
+        let result = active_rec.session.stop()?;
+        if result.frames_written == 0 {
+            let _ = std::fs::remove_file(&result.output_path);
+            return Err(EngineError::Validation(
+                "recording captured no audio samples (check microphone selection and permissions)"
+                    .into(),
+            ));
+        }
+
+        let probed = ffprobe::probe(&result.output_path)?;
+        let asset_id = Uuid::new_v4();
+        let asset = Asset {
+            id: asset_id,
+            kind: AssetKind::Audio,
+            name: take_name.clone(),
+            path: result.output_path.clone(),
+            probe: Some(probed.probe.clone()),
+            generated: None,
+        };
+        let duration_ticks = asset.editable_duration();
+
+        let mut placed_clip = Value::Null;
+        {
+            let active = self.require_active_mut()?;
+            let snapshot = take_snapshot(active, "record_voiceover");
+            active.undo.push(snapshot);
+            if active.undo.len() > HISTORY_LIMIT {
+                active.undo.remove(0);
+            }
+            active.redo.clear();
+            active.project.assets.push(asset);
+
+            if auto_place && duration_ticks > 0 {
+                let target_track = choose_voiceover_track(
+                    &mut active.project,
+                    requested_track_id,
+                    insert_at,
+                    insert_at + duration_ticks,
+                );
+                let track_name = active
+                    .project
+                    .track(&target_track)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "Voiceover".into());
+                let clip_id = Uuid::new_v4();
+                let clip = Clip {
+                    id: clip_id,
+                    asset_id,
+                    track_id: target_track,
+                    timeline_start: insert_at,
+                    source_in: 0,
+                    source_out: duration_ticks,
+                    link_group: None,
+                    opacity: 1.0,
+                    scale: 1.0,
+                    x_offset: 0.0,
+                    y_offset: 0.0,
+                    volume: 1.0,
+                    fade_in_ticks: 0,
+                    fade_out_ticks: 0,
+                    speed: 1.0,
+                    rotation_deg: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                    crop: Default::default(),
+                    motion: None,
+                    color: Default::default(),
+                };
+                active.project.clips.push(clip);
+                active.project.editor.selection = vec![Selection::Clip(clip_id)];
+                placed_clip = json!({
+                    "clip_id": clip_id,
+                    "track_id": target_track,
+                    "track_name": track_name,
+                    "timeline_start": insert_at,
+                    "timeline_end": insert_at + duration_ticks,
+                });
+            }
+
+            active.project.revision += 1;
+            Self::autosave(active)?;
+        }
+
+        Ok(json!({
+            "discarded": false,
+            "recording_id": recording_id,
+            "asset_id": asset_id,
+            "name": take_name,
+            "path": result.output_path.display().to_string(),
+            "device": device,
+            "backend": result.backend,
+            "sample_rate": result.sample_rate,
+            "channels": result.channels,
+            "studio_polished": result.studio_polished,
+            "duration_ticks": duration_ticks,
+            "duration_secs": cutpilot_core::secs_from_ticks(duration_ticks),
+            "placed_clip": placed_clip,
+            "probe": serde_json::to_value(&probed.probe)
+                .map_err(|e| EngineError::Validation(e.to_string()))?,
+        }))
+    }
+
     fn autosave(active: &ActiveProject) -> Result<(), EngineError> {
         let file = project_io::project_file(&active.dir);
         project_io::write_atomic(&file, &active.project)
@@ -1659,6 +2139,140 @@ fn create_audio_track(project: &mut Project) -> Uuid {
         volume: 1.0,
     });
     id
+}
+
+fn track_is_free_for_range(project: &Project, track_id: &Uuid, start: Ticks, end: Ticks) -> bool {
+    !project
+        .clips
+        .iter()
+        .any(|c| c.track_id == *track_id && start < c.timeline_end() && c.timeline_start < end)
+}
+
+/// Find the best existing unlocked audio track for a voiceover covering `start..end`,
+/// preferring tracks already dedicated to voiceover / standalone audio over tracks
+/// that hold linked video audio.
+fn find_free_voiceover_track(project: &Project, start: Ticks, end: Ticks) -> Option<Uuid> {
+    let candidates: Vec<&Track> = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Audio && !t.locked)
+        .filter(|t| track_is_free_for_range(project, &t.id, start, end))
+        .collect();
+
+    // 1. Prefer an existing track named "Voiceover*" that is free at this range.
+    if let Some(t) = candidates
+        .iter()
+        .find(|t| t.name.to_ascii_lowercase().starts_with("voiceover"))
+    {
+        return Some(t.id);
+    }
+    // 2. Next prefer a standalone (non-linked) audio track or an empty audio track.
+    if let Some(t) = candidates.iter().find(|t| {
+        project
+            .clips
+            .iter()
+            .filter(|c| c.track_id == t.id)
+            .all(|c| c.link_group.is_none())
+    }) {
+        return Some(t.id);
+    }
+    // 3. Otherwise any free unlocked audio track.
+    candidates.first().map(|t| t.id)
+}
+
+/// Choose or create an audio track for placing a finished voiceover recording.
+fn choose_voiceover_track(
+    project: &mut Project,
+    requested: Option<Uuid>,
+    start: Ticks,
+    end: Ticks,
+) -> Uuid {
+    if let Some(tid) = requested {
+        if let Some(track) = project.track(&tid) {
+            if track.kind == TrackKind::Audio
+                && !track.locked
+                && track_is_free_for_range(project, &tid, start, end)
+            {
+                return tid;
+            }
+        }
+    }
+    if let Some(tid) = find_free_voiceover_track(project, start, end) {
+        return tid;
+    }
+    let existing_vo = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Audio && t.name.to_ascii_lowercase().starts_with("voiceover"))
+        .count();
+    let name = if existing_vo == 0 {
+        "Voiceover".to_string()
+    } else {
+        format!("Voiceover {}", existing_vo + 1)
+    };
+    let id = Uuid::new_v4();
+    project.tracks.push(Track {
+        id,
+        kind: TrackKind::Audio,
+        name,
+        muted: false,
+        hidden: false,
+        locked: false,
+        volume: 1.0,
+    });
+    id
+}
+
+fn sanitize_recording_stem(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else if c.is_whitespace() {
+                '-'
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c| c == '-' || c == '_' || c == '.');
+    if trimmed.is_empty() {
+        "voiceover".into()
+    } else {
+        trimmed.chars().take(64).collect()
+    }
+}
+
+fn next_recording_path(recordings_dir: &Path, custom_name: Option<&str>) -> (String, PathBuf) {
+    if let Some(raw) = custom_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let stem = sanitize_recording_stem(raw);
+        let first = recordings_dir.join(format!("{stem}.wav"));
+        if !first.exists() {
+            return (stem, first);
+        }
+        for i in 2..10_000 {
+            let candidate_stem = format!("{stem}-{i}");
+            let candidate = recordings_dir.join(format!("{candidate_stem}.wav"));
+            if !candidate.exists() {
+                return (candidate_stem, candidate);
+            }
+        }
+    }
+    for i in 1..10_000 {
+        let stem = format!("voiceover-{i:03}");
+        let candidate = recordings_dir.join(format!("{stem}.wav"));
+        if !candidate.exists() {
+            return (stem, candidate);
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stem = format!("voiceover-{stamp}");
+    (stem.clone(), recordings_dir.join(format!("{stem}.wav")))
 }
 
 fn ensure_overlay_track(project: &mut Project) -> Uuid {
